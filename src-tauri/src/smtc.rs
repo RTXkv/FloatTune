@@ -54,6 +54,10 @@ pub struct TrackSnapshot {
     /// 状态最近一次变化的时刻（进程内毫秒），用于把隐藏延迟锚定到物理暂停
     #[serde(default)]
     pub status_changed_at: u64,
+    /// 歌曲代际：每次确认切歌 +1。异步结果（封面等）写入前必须校验
+    /// 代际一致，防止旧歌的慢结果覆盖新歌状态
+    #[serde(default)]
+    pub track_generation: u64,
 }
 
 /// 切歌间隙：标题刚变过时静音不算暂停
@@ -85,17 +89,20 @@ fn spawn_sampler(
 ) {
     std::thread::Builder::new()
         .name("smtc-sample".into())
-        .spawn(move || loop {
-            let raw = smtc_raw_status(&manager);
-            let tl = find_media_session(&manager).and_then(|s| s.GetTimelineProperties().ok()).and_then(|t| {
-                let pos = t.Position().map(|v| (v.Duration.max(0) as u64) / 10_000).unwrap_or(0);
-                let dur = t.EndTime().map(|v| (v.Duration.max(0) as u64) / 10_000).unwrap_or(0);
-                if dur > 0 { Some((pos, dur)) } else { None }
-            });
-            if let Ok(mut s) = sample.lock() {
-                *s = SmtcSample { at: Instant::now(), raw, tl };
+        .spawn(move || {
+            let _com = CoInitGuard::new();
+            loop {
+                let raw = smtc_raw_status(&manager);
+                let tl = find_media_session(&manager).and_then(|s| s.GetTimelineProperties().ok()).and_then(|t| {
+                    let pos = t.Position().map(|v| (v.Duration.max(0) as u64) / 10_000).unwrap_or(0);
+                    let dur = t.EndTime().map(|v| (v.Duration.max(0) as u64) / 10_000).unwrap_or(0);
+                    if dur > 0 { Some((pos, dur)) } else { None }
+                });
+                if let Ok(mut s) = sample.lock() {
+                    *s = SmtcSample { at: Instant::now(), raw, tl };
+                }
+                std::thread::sleep(Duration::from_millis(TICK_MS));
             }
-            std::thread::sleep(Duration::from_millis(TICK_MS));
         })
         .expect("spawn smtc sampler");
 }
@@ -145,7 +152,28 @@ pub fn send_media_key(vk: VIRTUAL_KEY) {
     }
 }
 
-/// 启动 SMTC 服务：决策循环 + 慢路径线程
+/// COM MTA 初始化 RAII：线程结束自动 CoUninitialize 配对。
+/// 短命线程（封面/命令）反复 spawn 时不配对会累积 MTA 引用计数。
+struct CoInitGuard;
+
+impl CoInitGuard {
+    fn new() -> Self {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        Self
+    }
+}
+
+impl Drop for CoInitGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::System::Com::CoUninitialize();
+        }
+    }
+}
+
+/// 启动 SMTC 服务：决策循环 + 命令 worker（串行队列）
 pub fn spawn(
     app: tauri::AppHandle,
     rx: Receiver<MediaCommand>,
@@ -153,14 +181,32 @@ pub fn spawn(
 ) {
     std::thread::Builder::new()
         .name("smtc-watch".into())
-        .spawn(move || watch(app, rx, snapshot))
+        .spawn(move || watch(app, snapshot))
         .expect("spawn smtc watcher");
+    std::thread::Builder::new()
+        .name("command-worker".into())
+        .spawn(move || command_worker(rx))
+        .expect("spawn command worker");
 }
 
-fn watch(app: tauri::AppHandle, rx: Receiver<MediaCommand>, snapshot: Arc<Mutex<TrackSnapshot>>) {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+/// 命令 worker：rx 的唯一消费者，**串行**处理所有媒体指令。
+/// 并发处理会让两条命令互相触发对方的验证误判（A 的媒体键把 B 等的状态
+/// 变化确认掉），串行队列同时天然实现命令排队。
+fn command_worker(rx: Receiver<MediaCommand>) {
+    let _com = CoInitGuard::new();
+    let manager: Option<GlobalSystemMediaTransportControlsSessionManager> =
+        GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .ok()
+            .and_then(|op| op.get().ok());
+    let mut seq: u64 = 0;
+    while let Ok(cmd) = rx.recv() {
+        seq += 1;
+        handle_command(manager.as_ref(), cmd, seq);
     }
+}
+
+fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
+    let _com = CoInitGuard::new();
     let start = Instant::now();
 
     // 慢路径资源：SMTC 管理器（控制指令 + 封面）。创建失败不影响快路径。
@@ -190,16 +236,8 @@ fn watch(app: tauri::AppHandle, rx: Receiver<MediaCommand>, snapshot: Arc<Mutex<
     let mut tick: u64 = 0;
 
     loop {
-        // 1. 控制指令：非阻塞取出，后台线程处理（SMTC 可能卡，不拖累循环）
-        while let Ok(cmd) = rx.try_recv() {
-            let m = manager.clone();
-            std::thread::Builder::new()
-                .name("media-cmd".into())
-                .spawn(move || handle_command(m.as_ref(), cmd))
-                .ok();
-        }
-
-        // 2. 快路径采样：窗口标题（Win32）+ 音频会话（CoreAudio）+ SMTC 采样缓存
+        // 1. 快路径采样：窗口标题（Win32）+ 音频会话（CoreAudio）+ SMTC 采样缓存
+        // （控制指令由 command-worker 串行消费，与决策循环隔离）
         let raw_title = crate::win32::netease_window_title();
         let inactive = crate::volume::cloudmusic_session_inactive();
         let (smtc_raw, tl_now) = {
@@ -363,6 +401,8 @@ fn watch(app: tauri::AppHandle, rx: Receiver<MediaCommand>, snapshot: Arc<Mutex<
                         // 再置有效（防止歌词匹配用旧歌时长打分误伤）
                         snap.timeline_valid = false;
                         snap.duration_ms = 0;
+                        // 歌曲代际 +1：在途异步结果（封面重试等）以此判断是否过期
+                        snap.track_generation += 1;
                     }
                     let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let _ = app.emit("smtc:track", &snap);
@@ -467,13 +507,25 @@ fn kick_cover(
     std::thread::Builder::new()
         .name("cover-fetch".into())
         .spawn(move || {
-            unsafe {
-                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            }
+            let _com = CoInitGuard::new();
+            // 本次封面任务所属的歌曲代际：重试窗口（最长 ~7s）内用户再切歌时，
+            // 旧任务的写入必须作废（generation 是比标题更严格的归属校验）
+            let gen = snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .track_generation;
             // 最多 6 次 × 1.2s（网易云封面流慢半拍；单次请求可能挂起数秒）。
             // 每次先校验 SMTC 元数据标题已跟上当前歌——元数据还是上一首时
             // 取到的封面必然也是旧的，"成功即停"会让旧封面永久停留
             for attempt in 0..6u32 {
+                let cur_gen = snapshot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .track_generation;
+                if cur_gen != gen {
+                    // 已切歌：新歌有自己的封面任务，本任务全部作废
+                    break;
+                }
                 let props = find_session_props(&manager);
                 if let Some(props) = props {
                     let ptitle = props.Title().map(|x| x.to_string()).unwrap_or_default();
@@ -487,7 +539,9 @@ fn kick_cover(
                         if let Ok(cov) = fetch_cover(&props) {
                             {
                                 let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
-                                s.cover_b64 = Some(cov);
+                                if s.track_generation == gen {
+                                    s.cover_b64 = Some(cov);
+                                }
                             }
                             let s = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                             let _ = app.emit("smtc:track", &s);
@@ -568,10 +622,15 @@ fn try_smtc_once(
 fn handle_command(
     manager: Option<&GlobalSystemMediaTransportControlsSessionManager>,
     cmd: MediaCommand,
+    seq: u64,
 ) {
-    // InfLink 的 SMTC 转发实测会丢命令（返回 True 但无效果），
-    // 所以每条指令都带"验证 + 媒体键补发"。
-    // 记录当前标题供切歌验证（本线程可能阻塞，与决策循环隔离）
+    let id = format!("cmd#{}", seq);
+    // InfLink 的 SMTC 转发实测会丢命令（返回 True 但无效果），所以带验证。
+    // **但验证失败 ≠ 没执行**（状态更新有延迟），补发策略按指令性质区分：
+    //   - Next/Prev 非幂等：重复执行 = 跳两首，代价远大于偶尔没反应。
+    //     SMTC 发送成功 → 只验证，绝不补发；发送失败（通道不可用）→ 媒体键一次。
+    //   - PlayPause：验证失败后补发一次媒体键（对抗 InfLink 丢命令），
+    //     但去掉旧实现的第三次发送——补发链越长，回弹概率越高。
     if let Some(m) = manager {
         if let Some(props) =
             find_media_session(m).and_then(|s| s.TryGetMediaPropertiesAsync().and_then(|o| o.get()).ok())
@@ -581,6 +640,7 @@ fn handle_command(
         }
     }
     let Some(m) = manager else {
+        eprintln!("[{}] no smtc manager, media key only", id);
         send_media_key(match cmd {
             MediaCommand::PlayPause => VK_MEDIA_PLAY_PAUSE,
             MediaCommand::Next => VK_MEDIA_NEXT_TRACK,
@@ -589,27 +649,48 @@ fn handle_command(
         return;
     };
     let before = smtc_raw_status(m);
-
-    // 三次尝试验证链：SMTC toggle → 媒体键 → 媒体键。
-    // InfLink 转发实测丢 ~50% 命令，且返回 True 不代表生效，必须验证。
-    // 验证窗口 2.5s（InfLink 状态推送为 1s 节奏）。
-    if try_smtc_once(m, cmd) && verify_changed(m, &before, cmd, 2500) {
-        return;
-    }
     let vk = match cmd {
         MediaCommand::PlayPause => VK_MEDIA_PLAY_PAUSE,
         MediaCommand::Next => VK_MEDIA_NEXT_TRACK,
         MediaCommand::Prev => VK_MEDIA_PREV_TRACK,
     };
-    send_media_key(vk);
-    if verify_changed(m, &before, cmd, 2500) {
+
+    let smtc_ok = try_smtc_once(m, cmd);
+    eprintln!("[{}] {:?} smtc_ok={}", id, cmd, smtc_ok);
+    if smtc_ok && verify_changed(m, &before, cmd, 2500) {
+        eprintln!("[{}] confirmed (smtc channel)", id);
         return;
     }
-    send_media_key(vk);
-    let _ = verify_changed(m, &before, cmd, 2500);
+    match cmd {
+        MediaCommand::PlayPause => {
+            // 补发一次媒体键（独立通道，绕过 InfLink 转发）
+            send_media_key(vk);
+            if verify_changed(m, &before, cmd, 2500) {
+                eprintln!("[{}] confirmed (media key)", id);
+            } else {
+                // 不再第三次发送：可能已执行，状态延迟中
+                eprintln!("[{}] unconfirmed (may still be executing)", id);
+            }
+        }
+        _ => {
+            if smtc_ok {
+                // 发送通道已确认可达，验证失败按"可能已执行但状态滞后"处理，不补发
+                eprintln!("[{}] unconfirmed (likely executed, NOT resending non-idempotent)", id);
+            } else {
+                send_media_key(vk);
+                if verify_changed(m, &before, cmd, 2500) {
+                    eprintln!("[{}] confirmed (media key)", id);
+                } else {
+                    eprintln!("[{}] unconfirmed", id);
+                }
+            }
+        }
+    }
 }
 
-/// 验证指令是否真的生效：playpause 看播放状态翻转，切歌看标题变化
+/// 验证指令是否真的生效：playpause 看播放状态翻转；切歌交叉验证
+/// SMTC 元数据标题与网易云窗口标题（元数据可能滞后，窗口标题是网易云
+/// 自己维护的，通常先更新）
 fn verify_changed(
     m: &GlobalSystemMediaTransportControlsSessionManager,
     before: &Option<String>,
@@ -632,8 +713,16 @@ fn verify_changed(
                     .and_then(|s| s.TryGetMediaPropertiesAsync().and_then(|o| o.get()).ok())
                     .map(|p| p.Title().map(|t| t.to_string()).unwrap_or_default())
                     .unwrap_or_default();
-                if !title.is_empty() && title != title_before {
+                if !title.is_empty() && norm_loose(&title) != norm_loose(&title_before) {
                     return true;
+                }
+                // 窗口标题交叉验证
+                if let Some(raw) = crate::win32::netease_window_title() {
+                    if let Some((wtitle, _)) = parse_window_title(&raw) {
+                        if !wtitle.is_empty() && norm_loose(&wtitle) != norm_loose(&title_before) {
+                            return true;
+                        }
+                    }
                 }
             }
         }
