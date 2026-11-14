@@ -1105,3 +1105,48 @@ mod playpause_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+
+    fn baseline(smtc: &str, window: &str) -> CommandBaseline {
+        CommandBaseline { smtc_title: smtc.into(), window_title: window.into() }
+    }
+
+    /// 同源比较：SMTC 标题的变化用 SMTC 基准判定，窗口标题用窗口基准判定
+    #[test]
+    fn same_source_comparison() {
+        let b = baseline("晴天", "晴天 - 周杰伦");
+        // SMTC 源变化（格式差异被归一吸收）
+        assert_eq!(b.source_changed("晴天 (Live)", "晴天"), Some(true));
+        // SMTC 源未变
+        assert_eq!(b.source_changed("晴天", "晴天"), Some(false));
+    }
+
+    /// 窗口标题暂时为空 → 该源弃权（None），既不误报也不漏报
+    #[test]
+    fn missing_current_value_abstains() {
+        let b = baseline("晴天", "晴天 - 周杰伦");
+        assert_eq!(b.source_changed("", "晴天"), None);
+        // 基准缺失同样弃权
+        let b2 = baseline("", "晴天 - 周杰伦");
+        assert_eq!(b2.source_changed("别的歌", ""), None);
+    }
+
+    /// 归一化统一：空白/大小写差异不构成变化
+    #[test]
+    fn normalization_unified_across_sources() {
+        let b = baseline("Walk On", "Walk On - U2");
+        assert_eq!(b.source_changed("walk  on", "Walk On"), Some(false));
+    }
+
+    /// 防跨源误判：SMTC 标题与窗口标题格式不同但同歌 → 未变化
+    /// （旧实现拿窗口标题与 SMTC 基准比，这种场景会假阳性）
+    #[test]
+    fn cross_source_format_difference_not_a_change() {
+        let b = baseline("晴天", "晴天 (Live) - 周杰伦");
+        // 窗口标题带后缀是它自己的常态——用自己的基准判，未变化
+        assert_eq!(b.source_changed("晴天 (Live)", "晴天 (Live)"), Some(false));
+    }
+}
