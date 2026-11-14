@@ -624,6 +624,13 @@ fn find_session_props(
 }
 
 /// 发送 SMTC 指令（只发不发结果判定）
+/// 获取网易云的 SMTC 会话（定向指令用）
+fn smtc_session(
+    manager: &GlobalSystemMediaTransportControlsSessionManager,
+) -> Option<windows::Media::Control::GlobalSystemMediaTransportControlsSession> {
+    find_media_session(manager)
+}
+
 fn try_smtc_once(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     cmd: MediaCommand,
@@ -649,6 +656,60 @@ fn try_smtc_once(
     false
 }
 
+/// PlayPause 执行计划（纯函数可测试）
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlayPauseAction {
+    /// 定向 Play（当前 paused/stopped）——幂等：重复执行不会反向
+    DirectedPlay,
+    /// 定向 Pause（当前 playing）——幂等
+    DirectedPause,
+    /// 状态未知只能 toggle（非幂等）
+    Toggle,
+}
+
+/// 由当前已知状态决定 PlayPause 的执行方式。
+/// 有明确状态时优先定向控制，根除"二次 toggle 反向执行"的可能。
+fn plan_playpause(before: Option<&str>) -> PlayPauseAction {
+    match before {
+        Some("playing") => PlayPauseAction::DirectedPause,
+        Some("paused") | Some("stopped") => PlayPauseAction::DirectedPlay,
+        _ => PlayPauseAction::Toggle,
+    }
+}
+
+/// PlayPause 验证超时后的下一步（纯函数可测试）。
+/// attempt: 0 = 首次已发，1/2 = 第几次重试。
+/// 核心原则：**验证超时不反向**——重试只用同向定向指令（幂等）；
+/// 唯一允许媒体键 toggle 的场景是 SMTC 通道确认从未送达（此时第一次
+/// 必然没执行，toggle 无反向风险）。
+#[derive(Debug, PartialEq, Eq)]
+enum PlayPauseStep {
+    /// 再发一次同向定向指令
+    RetryDirected(PlayPauseAction),
+    /// 媒体键 toggle（仅 SMTC 通道确认不可达时）
+    MediaKey,
+    /// 放弃（可能已执行，状态延迟中）
+    Stop,
+}
+
+fn next_playpause_step(plan: &PlayPauseAction, smtc_ok_so_far: bool, attempt: u32) -> PlayPauseStep {
+    match plan {
+        // toggle 非幂等：验证超时绝不补发
+        PlayPauseAction::Toggle => PlayPauseStep::Stop,
+        directed => {
+            if attempt >= 2 {
+                PlayPauseStep::Stop
+            } else if smtc_ok_so_far {
+                // 通道可达，只是状态延迟 → 同向定向重试（幂等安全）
+                PlayPauseStep::RetryDirected(directed.clone())
+            } else {
+                // 定向指令从未送达 → 媒体键 toggle（此时无反向风险）
+                PlayPauseStep::MediaKey
+            }
+        }
+    }
+}
+
 fn handle_command(
     manager: Option<&GlobalSystemMediaTransportControlsSessionManager>,
     cmd: MediaCommand,
@@ -657,18 +718,11 @@ fn handle_command(
     let id = format!("cmd#{}", seq);
     // InfLink 的 SMTC 转发实测会丢命令（返回 True 但无效果），所以带验证。
     // **但验证失败 ≠ 没执行**（状态更新有延迟），补发策略按指令性质区分：
-    //   - Next/Prev 非幂等：重复执行 = 跳两首，代价远大于偶尔没反应。
-    //     SMTC 发送成功 → 只验证，绝不补发；发送失败（通道不可用）→ 媒体键一次。
-    //   - PlayPause：验证失败后补发一次媒体键（对抗 InfLink 丢命令），
-    //     但去掉旧实现的第三次发送——补发链越长，回弹概率越高。
-    if let Some(m) = manager {
-        if let Some(props) =
-            find_media_session(m).and_then(|s| s.TryGetMediaPropertiesAsync().and_then(|o| o.get()).ok())
-        {
-            let t = props.Title().map(|x| x.to_string()).unwrap_or_default();
-            TITLE_BEFORE.with(|c| *c.borrow_mut() = t);
-        }
-    }
+    //   - PlayPause：有明确状态时用定向 Play/Pause（幂等），验证超时后同向
+    //     定向重试——即使第一次已执行也不会被反向；只有确认 SMTC 通道从未
+    //     送达时才用媒体键 toggle。
+    //   - Next/Prev 非幂等：重复执行 = 跳两首。SMTC 发送成功 → 只验证绝不
+    //     补发；发送失败（通道不可用）→ 媒体键一次。
     let Some(m) = manager else {
         crate::flog!("[{}] no smtc manager, media key only", id);
         send_media_key(match cmd {
@@ -678,80 +732,178 @@ fn handle_command(
         });
         return;
     };
-    let before = smtc_raw_status(m);
-    let vk = match cmd {
-        MediaCommand::PlayPause => VK_MEDIA_PLAY_PAUSE,
-        MediaCommand::Next => VK_MEDIA_NEXT_TRACK,
-        MediaCommand::Prev => VK_MEDIA_PREV_TRACK,
-    };
+    let session = smtc_session(m);
+    match cmd {
+        MediaCommand::PlayPause => handle_playpause(m, session.as_ref(), id),
+        MediaCommand::Next | MediaCommand::Prev => handle_skip(m, session.as_ref(), cmd, id),
+    }
+}
 
-    let smtc_ok = try_smtc_once(m, cmd);
-    crate::flog!("[{}] {:?} smtc_ok={}", id, cmd, smtc_ok);
-    if smtc_ok && verify_changed(m, &before, cmd, 2500) {
+/// PlayPause：定向控制 + 幂等重试链
+fn handle_playpause(
+    m: &GlobalSystemMediaTransportControlsSessionManager,
+    session: Option<&windows::Media::Control::GlobalSystemMediaTransportControlsSession>,
+    id: String,
+) {
+    let before = smtc_raw_status(m);
+    let plan = plan_playpause(before.as_deref());
+    let expect: &str = match &plan {
+        PlayPauseAction::DirectedPlay => "playing",
+        PlayPauseAction::DirectedPause => "paused",
+        PlayPauseAction::Toggle => "",
+    };
+    crate::flog!(
+        "[{}] playpause plan={:?} before={:?}",
+        id,
+        plan,
+        before.as_deref().unwrap_or("unknown")
+    );
+    // 验证目标：定向模式验证"达到期望状态"，toggle 模式验证"与 before 不同"
+    let expect_opt = if expect.is_empty() { None } else { Some(expect) };
+
+    // 首次发送
+    let (mut smtc_ok, mut ever_smtc_ok) = match (&plan, session) {
+        (PlayPauseAction::Toggle, _) => {
+            let ok = try_smtc_once(m, MediaCommand::PlayPause);
+            (ok, ok)
+        }
+        (_, Some(s)) => {
+            let send = match &plan {
+                PlayPauseAction::DirectedPlay => SmtcSend::Play,
+                _ => SmtcSend::Pause,
+            };
+            let ok = send_smtc_direct(s, &send);
+            (ok, ok)
+        }
+        (_, None) => (false, false),
+    };
+    if smtc_ok && verify_status(m, expect_opt, before.as_deref(), 2500) {
         crate::flog!("[{}] confirmed (smtc channel)", id);
         return;
     }
-    match cmd {
-        MediaCommand::PlayPause => {
-            // 补发一次媒体键（独立通道，绕过 InfLink 转发）
-            send_media_key(vk);
-            if verify_changed(m, &before, cmd, 2500) {
-                crate::flog!("[{}] confirmed (media key)", id);
-            } else {
-                // 不再第三次发送：可能已执行，状态延迟中
-                crate::flog!("[{}] unconfirmed (may still be executing)", id);
+
+    // 重试链（由纯函数决策，永不反向）
+    for attempt in 1..=2u32 {
+        match next_playpause_step(&plan, ever_smtc_ok, attempt) {
+            PlayPauseStep::RetryDirected(action) => {
+                if let Some(s) = session {
+                    crate::flog!("[{}] retry {:?} (idempotent, attempt {})", id, action, attempt);
+                    smtc_ok = send_smtc_direct(
+                        s,
+                        &match action {
+                            PlayPauseAction::DirectedPlay => SmtcSend::Play,
+                            _ => SmtcSend::Pause,
+                        },
+                    );
+                    ever_smtc_ok |= smtc_ok;
+                    if smtc_ok && verify_status(m, expect_opt, before.as_deref(), 2500) {
+                        crate::flog!("[{}] confirmed (directed retry {})", id, attempt);
+                        return;
+                    }
+                } else {
+                    break;
+                }
             }
-        }
-        _ => {
-            if smtc_ok {
-                // 发送通道已确认可达，验证失败按"可能已执行但状态滞后"处理，不补发
-                crate::flog!("[{}] unconfirmed (likely executed, NOT resending non-idempotent)", id);
-            } else {
-                send_media_key(vk);
-                if verify_changed(m, &before, cmd, 2500) {
+            PlayPauseStep::MediaKey => {
+                // SMTC 通道确认从未送达 → toggle 无反向风险
+                crate::flog!("[{}] smtc channel dead, media key toggle", id);
+                send_media_key(VK_MEDIA_PLAY_PAUSE);
+                if verify_status(m, expect_opt, before.as_deref(), 2500) {
                     crate::flog!("[{}] confirmed (media key)", id);
                 } else {
-                    crate::flog!("[{}] unconfirmed", id);
+                    crate::flog!("[{}] unconfirmed (media key)", id);
                 }
+                return;
+            }
+            PlayPauseStep::Stop => {
+                crate::flog!("[{}] unconfirmed (may still be executing, not resending)", id);
+                return;
             }
         }
     }
 }
 
-/// 验证指令是否真的生效：playpause 看播放状态翻转；切歌交叉验证
-/// SMTC 元数据标题与网易云窗口标题（元数据可能滞后，窗口标题是网易云
-/// 自己维护的，通常先更新）
-fn verify_changed(
+/// Next/Prev：非幂等，SMTC 发送成功绝不补发
+fn handle_skip(
     m: &GlobalSystemMediaTransportControlsSessionManager,
-    before: &Option<String>,
+    session: Option<&windows::Media::Control::GlobalSystemMediaTransportControlsSession>,
     cmd: MediaCommand,
+    id: String,
+) {
+    let baseline = CommandBaseline::capture(Some(m));
+    let smtc_ok = match session {
+        Some(s) => send_smtc_direct(s, &match cmd {
+            MediaCommand::Next => SmtcSend::Next,
+            _ => SmtcSend::Prev,
+        }),
+        None => false,
+    };
+    crate::flog!("[{}] {:?} smtc_ok={}", id, cmd, smtc_ok);
+    if smtc_ok && verify_track_change(m, &baseline, 2500) {
+        crate::flog!("[{}] confirmed (smtc channel)", id);
+        return;
+    }
+    if smtc_ok {
+        crate::flog!("[{}] unconfirmed (likely executed, NOT resending non-idempotent)", id);
+        return;
+    }
+    // SMTC 通道未送达 → 媒体键一次（此时必然没执行，无重复风险）
+    send_media_key(match cmd {
+        MediaCommand::Next => VK_MEDIA_NEXT_TRACK,
+        _ => VK_MEDIA_PREV_TRACK,
+    });
+    if verify_track_change(m, &baseline, 2500) {
+        crate::flog!("[{}] confirmed (media key)", id);
+    } else {
+        crate::flog!("[{}] unconfirmed", id);
+    }
+}
+
+/// SMTC 定向指令
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SmtcSend {
+    Play,
+    Pause,
+    Next,
+    Prev,
+}
+
+fn send_smtc_direct(
+    s: &windows::Media::Control::GlobalSystemMediaTransportControlsSession,
+    a: &SmtcSend,
+) -> bool {
+    let op = match a {
+        SmtcSend::Play => s.TryPlayAsync(),
+        SmtcSend::Pause => s.TryPauseAsync(),
+        SmtcSend::Next => s.TrySkipNextAsync(),
+        SmtcSend::Prev => s.TrySkipPreviousAsync(),
+    };
+    op.and_then(|o| o.get()).is_ok()
+}
+
+/// 状态验证：Some(expect) = 定向验证达到期望状态（状态已经是期望值也算
+/// 成功，兼容手动操作后的场景）；None = toggle 验证与 before 不同（翻转）。
+/// 定向模式比"翻转"精确：状态延迟不再被误判为失败。
+fn verify_status(
+    m: &GlobalSystemMediaTransportControlsSessionManager,
+    expect: Option<&str>,
+    before: Option<&str>,
     window_ms: u64,
 ) -> bool {
-    let title_before = TITLE_BEFORE.with(|c| c.borrow().clone());
     let checks = (window_ms / 250).max(1);
     for _ in 0..checks {
         std::thread::sleep(Duration::from_millis(250));
-        match cmd {
-            MediaCommand::PlayPause => {
-                let now = smtc_raw_status(m);
-                if now.is_some() && before.is_some() && now != *before {
+        let now = smtc_raw_status(m);
+        match expect {
+            Some(e) => {
+                if now.as_deref() == Some(e) {
                     return true;
                 }
             }
-            _ => {
-                let title = find_media_session(m)
-                    .and_then(|s| s.TryGetMediaPropertiesAsync().and_then(|o| o.get()).ok())
-                    .map(|p| p.Title().map(|t| t.to_string()).unwrap_or_default())
-                    .unwrap_or_default();
-                if !title.is_empty() && norm_loose(&title) != norm_loose(&title_before) {
-                    return true;
-                }
-                // 窗口标题交叉验证
-                if let Some(raw) = crate::win32::netease_window_title() {
-                    if let Some((wtitle, _)) = parse_window_title(&raw) {
-                        if !wtitle.is_empty() && norm_loose(&wtitle) != norm_loose(&title_before) {
-                            return true;
-                        }
+            None => {
+                if let (Some(n), Some(b)) = (now.as_deref(), before) {
+                    if n != b {
+                        return true;
                     }
                 }
             }
@@ -760,8 +912,79 @@ fn verify_changed(
     false
 }
 
-thread_local! {
-    static TITLE_BEFORE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+/// 命令基准：操作前**两个数据源各自**的快照。验证时同源前后比较——
+/// 跨源比较会因格式差异（全半角/空白/后缀）产生假阳性/假阴性；
+/// 源缺失（窗口标题暂时为空等）时该源弃权，不参与判定
+struct CommandBaseline {
+    smtc_title: String,
+    window_title: String,
+}
+
+impl CommandBaseline {
+    fn capture(
+        m: Option<&GlobalSystemMediaTransportControlsSessionManager>,
+    ) -> Self {
+        let smtc_title = m
+            .and_then(|m| {
+                find_media_session(m)
+                    .and_then(|s| s.TryGetMediaPropertiesAsync().and_then(|o| o.get()).ok())
+            })
+            .map(|p| p.Title().map(|t| t.to_string()).unwrap_or_default())
+            .unwrap_or_default();
+        let window_title = crate::win32::netease_window_title()
+            .and_then(|r| parse_window_title(&r))
+            .map(|(t, _)| t)
+            .unwrap_or_default();
+        Self { smtc_title, window_title }
+    }
+
+    /// 单源前后变化判定：None = 该源数据缺失（弃权）
+    fn source_changed(&self, now: &str, before: &str) -> Option<bool> {
+        if before.is_empty() || now.is_empty() {
+            return None;
+        }
+        Some(norm_loose(now) != norm_loose(before))
+    }
+
+    /// 任一数据源检测到切歌
+    fn track_changed(
+        &self,
+        m: &GlobalSystemMediaTransportControlsSessionManager,
+    ) -> bool {
+        let smtc_now = find_media_session(m)
+            .and_then(|s| s.TryGetMediaPropertiesAsync().and_then(|o| o.get()).ok())
+            .map(|p| p.Title().map(|t| t.to_string()).unwrap_or_default())
+            .unwrap_or_default();
+        if let Some(true) = self.source_changed(&smtc_now, &self.smtc_title) {
+            return true;
+        }
+        if let Some((wtitle, _)) = crate::win32::netease_window_title()
+            .and_then(|r| parse_window_title(&r))
+        {
+            if let Some(true) = self.source_changed(&wtitle, &self.window_title) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// 切歌验证：任一数据源出现标题变化即确认（两个源更新时间不同，先后到达
+/// 都算数；同名歌曲连续来回切换无法用标题检测，按 unconfirmed 处理——
+/// 对不补发策略无害）
+fn verify_track_change(
+    m: &GlobalSystemMediaTransportControlsSessionManager,
+    baseline: &CommandBaseline,
+    window_ms: u64,
+) -> bool {
+    let checks = (window_ms / 250).max(1);
+    for _ in 0..checks {
+        std::thread::sleep(Duration::from_millis(250));
+        if baseline.track_changed(m) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -811,5 +1034,74 @@ mod tests {
         let raw = "NCM-2309212";
         let parsed = raw.strip_prefix("NCM-").and_then(|r| r.trim().parse::<u64>().ok());
         assert_eq!(parsed, Some(2309212));
+    }
+}
+
+#[cfg(test)]
+mod playpause_tests {
+    use super::*;
+
+    /// 任务书场景：第一次命令成功执行但状态延迟 → 重试必须是同向定向
+    /// 指令（幂等），绝不允许二次 toggle 反向
+    #[test]
+    fn verify_timeout_retry_is_same_direction_not_toggle() {
+        let plan = plan_playpause(Some("playing")); // 想 Pause
+        // 首次发送成功但验证超时
+        let step = next_playpause_step(&plan, true, 1);
+        match step {
+            PlayPauseStep::RetryDirected(a) => assert_eq!(a, PlayPauseAction::DirectedPause),
+            ref other => panic!("expected same-direction retry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn known_playing_plans_directed_pause() {
+        assert_eq!(plan_playpause(Some("playing")), PlayPauseAction::DirectedPause);
+    }
+
+    #[test]
+    fn known_paused_plans_directed_play() {
+        assert_eq!(plan_playpause(Some("paused")), PlayPauseAction::DirectedPlay);
+        assert_eq!(plan_playpause(Some("stopped")), PlayPauseAction::DirectedPlay);
+    }
+
+    #[test]
+    fn unknown_state_plans_toggle_and_never_retries() {
+        let plan = plan_playpause(None);
+        assert_eq!(plan, PlayPauseAction::Toggle);
+        // toggle 非幂等：验证超时不补发（无论通道是否可达）
+        assert_eq!(next_playpause_step(&plan, true, 1), PlayPauseStep::Stop);
+        assert_eq!(next_playpause_step(&plan, false, 1), PlayPauseStep::Stop);
+    }
+
+    #[test]
+    fn smtc_channel_dead_falls_to_media_key() {
+        // 定向指令从未送达 → toggle 无反向风险（第一次必然没执行）
+        let plan = plan_playpause(Some("playing"));
+        assert_eq!(next_playpause_step(&plan, false, 1), PlayPauseStep::MediaKey);
+    }
+
+    #[test]
+    fn retry_capped_at_two() {
+        let plan = plan_playpause(Some("paused"));
+        assert_eq!(next_playpause_step(&plan, true, 2), PlayPauseStep::Stop);
+        assert_eq!(next_playpause_step(&plan, true, 3), PlayPauseStep::Stop);
+    }
+
+    #[test]
+    fn directed_actions_are_idempotent_set() {
+        // 同向重试集合里只有 Play/Pause，绝无 Toggle
+        let retries = [
+            next_playpause_step(&plan_playpause(Some("playing")), true, 1),
+            next_playpause_step(&plan_playpause(Some("paused")), true, 1),
+        ];
+        for r in retries {
+            match r {
+                PlayPauseStep::RetryDirected(a) => {
+                    assert!(matches!(a, PlayPauseAction::DirectedPlay | PlayPauseAction::DirectedPause));
+                }
+                other => panic!("unexpected {:?}", other),
+            }
+        }
     }
 }
