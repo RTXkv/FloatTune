@@ -432,8 +432,15 @@ fn atomic_write(path: &std::path::Path, data: &str) {
     }
 }
 
-/// 内存 payload 缓存 + 全局请求闸门：并发请求（两个窗口同时请求同一首歌）
-/// 在闸门上排队，后到者命中内存缓存直接返回，避免重复网络请求
+/// 内存 payload 缓存 + 全局请求闸门。
+///
+/// 性能评估（任务书要求结论化）：本应用只有 strip/card 两个窗口并发请求，
+/// 请求频率 = 切歌频率（秒级），闸门排队的最坏等待 ≈ 前一请求的网络耗时
+/// （≤8s 超时）。改按 song_id single-flight 需要引入 per-key Notify/表结构
+/// 与失败清理状态机，收益仅限"两窗口同时请求不同歌"的场景——该场景实际
+/// 不存在（两窗口始终跟随同一首歌）。结论：保留全局闸门，不为复杂化而
+/// 重构。锁跨越网络 await 是设计使然（串行化排队）；payload_mem() 的
+/// std Mutex 仅在同步 get/insert 中短暂持有，不跨 await。
 static FETCH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static PAYLOAD_MEM: std::sync::OnceLock<Mutex<HashMap<String, LyricPayload>>> =
     std::sync::OnceLock::new();

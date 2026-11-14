@@ -208,6 +208,7 @@ pub fn spawn(
 /// 缓冲严格保序——绝不丢弃用户命令：
 /// - PlayPause ×偶数 → no-op（回到原状态，意图等价）；×奇数 → 一次 toggle
 /// - Next/Prev ×N → 连发 N 次（保留连续点击意图），只验证最后一次
+///
 /// SMTC manager 创建失败时按 5s→30s 指数退避重试；退避期间到达的命令
 /// 走媒体键兜底路径执行，不积压。
 fn command_worker(rx: Receiver<QueuedCommand>) {
@@ -291,7 +292,7 @@ fn execute_batch(
     let session = manager.and_then(smtc_session);
     match batch[0].cmd {
         MediaCommand::PlayPause => {
-            if batch.len() % 2 == 0 {
+            if batch.len().is_multiple_of(2) {
                 // 连续偶数次 toggle 回到原状态，意图等价于什么都不做
                 crate::flog!(
                     "[{}] playpause×{} folded to no-op (even toggles)",
@@ -822,14 +823,14 @@ fn next_playpause_step(plan: &PlayPauseAction, smtc_ok_so_far: bool, attempt: u3
     }
 }
 
-/// 补发策略（InfLink 的 SMTC 转发实测会丢命令，返回 True 但无效果，所以带
-/// 验证；**但验证失败 ≠ 没执行**——状态更新有延迟，补发策略按指令性质区分）：
-///   - PlayPause：有明确状态时用定向 Play/Pause（幂等），验证超时后同向
-///     定向重试——即使第一次已执行也不会被反向；只有确认 SMTC 通道从未
-///     送达时才用媒体键 toggle。
-///   - Next/Prev 非幂等：重复执行 = 跳两首。SMTC 发送成功 → 只验证绝不
-///     补发；发送失败（通道不可用）→ 媒体键一次。
-/// （分发入口为 execute_batch：同类型命令先折叠再执行）
+// 补发策略（InfLink 的 SMTC 转发实测会丢命令，返回 True 但无效果，所以带
+// 验证；**但验证失败 ≠ 没执行**——状态更新有延迟，补发策略按指令性质区分）：
+// - PlayPause：有明确状态时用定向 Play/Pause（幂等），验证超时后同向
+//   定向重试——即使第一次已执行也不会被反向；只有确认 SMTC 通道从未
+//   送达时才用媒体键 toggle。
+// - Next/Prev 非幂等：重复执行 = 跳两首。SMTC 发送成功 → 只验证绝不
+//   补发；发送失败（通道不可用）→ 媒体键一次。
+// （分发入口为 execute_batch：同类型命令先折叠再执行）
 
 /// PlayPause：定向控制 + 幂等重试链
 fn handle_playpause(

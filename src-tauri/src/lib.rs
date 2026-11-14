@@ -22,7 +22,11 @@ use tauri::{Emitter, Manager};
 // 超过 1MB 轮转为 floatune.log.1，最多保留一代。
 
 const LOG_MAX_BYTES: u64 = 1_000_000;
+/// 每 N 条日志做一次轮转检查（启动时 + 写入期均覆盖；逐条 stat 的开销
+/// 省掉，高频心跳下 I/O 仍是纯 append）
+const LOG_CHECK_EVERY: u32 = 200;
 static LOG_FILE: std::sync::OnceLock<Mutex<Option<fs::File>>> = std::sync::OnceLock::new();
+static LOG_WRITES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn open_log_file(dir: &PathBuf) -> Option<fs::File> {
     let _ = fs::create_dir_all(dir);
@@ -41,11 +45,29 @@ fn open_log_file(dir: &PathBuf) -> Option<fs::File> {
 pub fn log_write(msg: &str) {
     let line = format!("[{}] {}\n", win32::local_time_str(), msg);
     eprint!("{}", line);
+    let n = LOG_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let m = LOG_FILE.get_or_init(|| {
         let dir = dirs_data_dir().unwrap_or_else(|| PathBuf::from("."));
         Mutex::new(open_log_file(&dir))
     });
     let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    // 写入期轮转检查（每 200 条一次）：长期运行不再受"只在启动时检查"
+    // 的限制；替换失败（文件被外部占用）则丢弃后续写入，不影响主程序
+    if n % LOG_CHECK_EVERY == 0 {
+        if let Some(f) = guard.as_mut() {
+            if let Ok(meta) = f.metadata() {
+                if meta.len() > LOG_MAX_BYTES {
+                    if let Some(dir) = dirs_data_dir() {
+                        use std::io::Write;
+                        let _ = f.flush();
+                        *guard = None; // 关闭旧句柄后改名
+                        let _ = fs::rename(dir.join("floatune.log"), dir.join("floatune.log.1"));
+                        *guard = open_log_file(&dir);
+                    }
+                }
+            }
+        }
+    }
     if let Some(f) = guard.as_mut() {
         use std::io::Write;
         let _ = f.write_all(line.as_bytes());
