@@ -16,7 +16,7 @@
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Emitter;
@@ -177,10 +177,17 @@ impl Drop for CoInitGuard {
     }
 }
 
+/// 队列命令：入队时间戳用于等待时间统计
+#[derive(Debug, Clone, Copy)]
+pub struct QueuedCommand {
+    pub cmd: MediaCommand,
+    pub enqueued_at: Instant,
+}
+
 /// 启动 SMTC 服务：决策循环 + 命令 worker（串行队列）
 pub fn spawn(
     app: tauri::AppHandle,
-    rx: Receiver<MediaCommand>,
+    rx: Receiver<QueuedCommand>,
     snapshot: Arc<Mutex<TrackSnapshot>>,
 ) {
     std::thread::Builder::new()
@@ -196,16 +203,121 @@ pub fn spawn(
 /// 命令 worker：rx 的唯一消费者，**串行**处理所有媒体指令。
 /// 并发处理会让两条命令互相触发对方的验证误判（A 的媒体键把 B 等的状态
 /// 变化确认掉），串行队列同时天然实现命令排队。
-fn command_worker(rx: Receiver<MediaCommand>) {
+///
+/// 积压管理：连续**同类型**命令折叠成批处理（≤8），不同类型经 pending
+/// 缓冲严格保序——绝不丢弃用户命令：
+/// - PlayPause ×偶数 → no-op（回到原状态，意图等价）；×奇数 → 一次 toggle
+/// - Next/Prev ×N → 连发 N 次（保留连续点击意图），只验证最后一次
+/// SMTC manager 创建失败时按 5s→30s 指数退避重试；退避期间到达的命令
+/// 走媒体键兜底路径执行，不积压。
+fn command_worker(rx: Receiver<QueuedCommand>) {
     let _com = CoInitGuard::new();
-    let manager: Option<GlobalSystemMediaTransportControlsSessionManager> =
-        GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-            .ok()
-            .and_then(|op| op.get().ok());
+    let mut manager: Option<GlobalSystemMediaTransportControlsSessionManager> = None;
     let mut seq: u64 = 0;
-    while let Ok(cmd) = rx.recv() {
+    let mut backoff: u64 = 5;
+    let mut pending: Option<QueuedCommand> = None;
+    loop {
+        let first = match pending.take() {
+            Some(c) => Some(c),
+            None if manager.is_some() => match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(c) => Some(c),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv_timeout(Duration::from_secs(backoff)) {
+                Ok(c) => Some(c),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+                        .ok()
+                        .and_then(|op| op.get().ok());
+                    if manager.is_some() {
+                        crate::flog!("[worker] smtc manager acquired after backoff");
+                        backoff = 5;
+                    } else {
+                        backoff = (backoff * 2).min(30);
+                        crate::flog!("[worker] smtc manager unavailable, retry in {}s", backoff);
+                    }
+                    None
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+        };
+        let Some(first) = first else { continue };
+
+        // 收集同类型积压（≤8），异类进 pending 保序
+        let mut batch = vec![first];
+        while batch.len() < 8 {
+            match rx.try_recv() {
+                Ok(c) if kind_of(c.cmd) == kind_of(batch[0].cmd) => batch.push(c),
+                Ok(c) => {
+                    pending = Some(c);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
         seq += 1;
-        handle_command(manager.as_ref(), cmd, seq);
+        let waited_ms = first.enqueued_at.elapsed().as_millis();
+        let t0 = Instant::now();
+        let last_id = seq + batch.len() as u64 - 1;
+        execute_batch(manager.as_ref(), &batch, seq);
+        crate::flog!(
+            "[cmd#{}..{}] batch n={} waited={}ms exec={}ms",
+            seq,
+            last_id,
+            batch.len(),
+            waited_ms,
+            t0.elapsed().as_millis()
+        );
+    }
+}
+
+/// 命令类型标识（折叠分组用）
+fn kind_of(cmd: MediaCommand) -> u8 {
+    match cmd {
+        MediaCommand::PlayPause => 0,
+        MediaCommand::Next => 1,
+        MediaCommand::Prev => 2,
+    }
+}
+
+/// 执行一个同类型批次
+fn execute_batch(
+    manager: Option<&GlobalSystemMediaTransportControlsSessionManager>,
+    batch: &[QueuedCommand],
+    seq: u64,
+) {
+    let id = format!("cmd#{}", seq);
+    let session = manager.and_then(smtc_session);
+    match batch[0].cmd {
+        MediaCommand::PlayPause => {
+            if batch.len() % 2 == 0 {
+                // 连续偶数次 toggle 回到原状态，意图等价于什么都不做
+                crate::flog!(
+                    "[{}] playpause×{} folded to no-op (even toggles)",
+                    id,
+                    batch.len()
+                );
+                return;
+            }
+            match manager {
+                Some(m) => handle_playpause(m, session.as_ref(), id),
+                None => {
+                    crate::flog!("[{}] no smtc manager, media key toggle", id);
+                    send_media_key(VK_MEDIA_PLAY_PAUSE);
+                }
+            }
+        }
+        MediaCommand::Next | MediaCommand::Prev => match manager {
+            Some(m) => handle_skip_n(m, session.as_ref(), batch[0].cmd, batch.len(), id),
+            None => {
+                crate::flog!("[{}] no smtc manager, media key {:?}", id, batch[0].cmd);
+                send_media_key(match batch[0].cmd {
+                    MediaCommand::Next => VK_MEDIA_NEXT_TRACK,
+                    _ => VK_MEDIA_PREV_TRACK,
+                });
+            }
+        },
     }
 }
 
@@ -710,34 +822,14 @@ fn next_playpause_step(plan: &PlayPauseAction, smtc_ok_so_far: bool, attempt: u3
     }
 }
 
-fn handle_command(
-    manager: Option<&GlobalSystemMediaTransportControlsSessionManager>,
-    cmd: MediaCommand,
-    seq: u64,
-) {
-    let id = format!("cmd#{}", seq);
-    // InfLink 的 SMTC 转发实测会丢命令（返回 True 但无效果），所以带验证。
-    // **但验证失败 ≠ 没执行**（状态更新有延迟），补发策略按指令性质区分：
-    //   - PlayPause：有明确状态时用定向 Play/Pause（幂等），验证超时后同向
-    //     定向重试——即使第一次已执行也不会被反向；只有确认 SMTC 通道从未
-    //     送达时才用媒体键 toggle。
-    //   - Next/Prev 非幂等：重复执行 = 跳两首。SMTC 发送成功 → 只验证绝不
-    //     补发；发送失败（通道不可用）→ 媒体键一次。
-    let Some(m) = manager else {
-        crate::flog!("[{}] no smtc manager, media key only", id);
-        send_media_key(match cmd {
-            MediaCommand::PlayPause => VK_MEDIA_PLAY_PAUSE,
-            MediaCommand::Next => VK_MEDIA_NEXT_TRACK,
-            MediaCommand::Prev => VK_MEDIA_PREV_TRACK,
-        });
-        return;
-    };
-    let session = smtc_session(m);
-    match cmd {
-        MediaCommand::PlayPause => handle_playpause(m, session.as_ref(), id),
-        MediaCommand::Next | MediaCommand::Prev => handle_skip(m, session.as_ref(), cmd, id),
-    }
-}
+/// 补发策略（InfLink 的 SMTC 转发实测会丢命令，返回 True 但无效果，所以带
+/// 验证；**但验证失败 ≠ 没执行**——状态更新有延迟，补发策略按指令性质区分）：
+///   - PlayPause：有明确状态时用定向 Play/Pause（幂等），验证超时后同向
+///     定向重试——即使第一次已执行也不会被反向；只有确认 SMTC 通道从未
+///     送达时才用媒体键 toggle。
+///   - Next/Prev 非幂等：重复执行 = 跳两首。SMTC 发送成功 → 只验证绝不
+///     补发；发送失败（通道不可用）→ 媒体键一次。
+/// （分发入口为 execute_batch：同类型命令先折叠再执行）
 
 /// PlayPause：定向控制 + 幂等重试链
 fn handle_playpause(
@@ -824,38 +916,52 @@ fn handle_playpause(
 }
 
 /// Next/Prev：非幂等，SMTC 发送成功绝不补发
-fn handle_skip(
+/// Next/Prev 连发 N 次（保留连续点击意图），每次独立尝试：
+/// SMTC 可达走 SMTC，失败的那次用媒体键保意图（该次确定没执行）；
+/// 全部发送后只验证一次——中间跳过的歌无需逐首确认
+fn handle_skip_n(
     m: &GlobalSystemMediaTransportControlsSessionManager,
     session: Option<&windows::Media::Control::GlobalSystemMediaTransportControlsSession>,
     cmd: MediaCommand,
+    n: usize,
     id: String,
 ) {
     let baseline = CommandBaseline::capture(Some(m));
-    let smtc_ok = match session {
-        Some(s) => send_smtc_direct(s, &match cmd {
-            MediaCommand::Next => SmtcSend::Next,
-            _ => SmtcSend::Prev,
-        }),
-        None => false,
+    let send = match cmd {
+        MediaCommand::Next => SmtcSend::Next,
+        _ => SmtcSend::Prev,
     };
-    crate::flog!("[{}] {:?} smtc_ok={}", id, cmd, smtc_ok);
-    if smtc_ok && verify_track_change(m, &baseline, 2500) {
-        crate::flog!("[{}] confirmed (smtc channel)", id);
-        return;
-    }
-    if smtc_ok {
-        crate::flog!("[{}] unconfirmed (likely executed, NOT resending non-idempotent)", id);
-        return;
-    }
-    // SMTC 通道未送达 → 媒体键一次（此时必然没执行，无重复风险）
-    send_media_key(match cmd {
+    let vk = match cmd {
         MediaCommand::Next => VK_MEDIA_NEXT_TRACK,
         _ => VK_MEDIA_PREV_TRACK,
-    });
+    };
+    let mut via_smtc = 0usize;
+    let mut via_key = 0usize;
+    for i in 0..n {
+        let ok = match session {
+            Some(s) => send_smtc_direct(s, &send),
+            None => false,
+        };
+        if ok {
+            via_smtc += 1;
+        } else {
+            // 该次 SMTC 未送达（确定没执行）→ 媒体键保意图
+            send_media_key(vk);
+            via_key += 1;
+        }
+        if i + 1 < n {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+    crate::flog!("[{}] {:?}×{} sent (smtc={} key={})", id, cmd, n, via_smtc, via_key);
     if verify_track_change(m, &baseline, 2500) {
-        crate::flog!("[{}] confirmed (media key)", id);
+        crate::flog!("[{}] confirmed", id);
     } else {
-        crate::flog!("[{}] unconfirmed", id);
+        crate::flog!(
+            "[{}] unconfirmed ({} skips may have executed, title lagging)",
+            id,
+            via_smtc + via_key
+        );
     }
 }
 

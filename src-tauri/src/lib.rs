@@ -9,7 +9,7 @@ mod volume;
 mod win32;
 
 use settings::Settings;
-use smtc::{MediaCommand, TrackSnapshot};
+use smtc::{QueuedCommand, TrackSnapshot};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -79,7 +79,7 @@ fn throttle_save(app: &tauri::AppHandle) {
 pub struct AppState {
     pub settings: Mutex<Settings>,
     pub snapshot: Arc<Mutex<TrackSnapshot>>,
-    pub media_tx: mpsc::Sender<MediaCommand>,
+    pub media_tx: mpsc::SyncSender<QueuedCommand>,
     pub data_dir: PathBuf,
     pub lyric_key_cache: Mutex<HashMap<String, netease::TrackKey>>,
     pub fullscreen: std::sync::atomic::AtomicBool,
@@ -239,12 +239,17 @@ fn get_state(state: tauri::State<AppState>) -> TrackSnapshot {
 #[tauri::command]
 fn media_cmd(state: tauri::State<AppState>, cmd: String) -> Result<(), String> {
     let c = match cmd.as_str() {
-        "playpause" => MediaCommand::PlayPause,
-        "next" => MediaCommand::Next,
-        "prev" => MediaCommand::Prev,
+        "playpause" => smtc::MediaCommand::PlayPause,
+        "next" => smtc::MediaCommand::Next,
+        "prev" => smtc::MediaCommand::Prev,
         _ => return Err(format!("未知指令 {cmd}")),
     };
-    state.media_tx.send(c).map_err(|e| e.to_string())
+    // 有界队列：满时丢弃该条（极端连点的过期处理，worker 侧折叠积压）
+    let qc = QueuedCommand { cmd: c, enqueued_at: std::time::Instant::now() };
+    state.media_tx.try_send(qc).map_err(|e| {
+        crate::flog!("[media] queue full: {}", e);
+        e.to_string()
+    })
 }
 
 #[tauri::command]
@@ -359,7 +364,8 @@ pub fn run() {
             }
 
             // SMTC 监听线程（RequestAsync 不依赖窗口句柄）
-            let (tx, rx) = mpsc::channel::<MediaCommand>();
+            // 有界命令队列：满时丢弃（极端连点的过期处理），worker 侧折叠积压
+            let (tx, rx) = mpsc::sync_channel::<smtc::QueuedCommand>(32);
             let snapshot = Arc::new(Mutex::new(TrackSnapshot::default()));
             smtc::spawn(handle.clone(), rx, snapshot.clone());
 
