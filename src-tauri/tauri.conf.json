@@ -1,0 +1,77 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FloatTune",
+  "version": "0.1.0",
+  "identifier": "com.floatune.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "strip",
+        "title": "FloatTune",
+        "url": "index.html?win=strip",
+        "width": 620,
+        "height": 52,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": true,
+        "shadow": false,
+        "focus": false
+      },
+      {
+        "label": "card",
+        "title": "FloatTune",
+        "url": "index.html?win=card",
+        "width": 280,
+        "height": 360,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": true,
+        "shadow": false,
+        "focus": false
+      },
+      {
+        "label": "settings",
+        "title": "FloatTune 设置",
+        "url": "index.html?win=settings",
+        "width": 440,
+        "height": 640,
+        "visible": false,
+        "decorations": true,
+        "transparent": false,
+        "resizable": false,
+        "center": true,
+        "backgroundColor": "#14141d"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "targets": [
+      "nsis"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    }
+  }
+}

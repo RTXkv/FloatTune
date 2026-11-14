@@ -1,0 +1,17 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+dev.log
+*.log
+.DS_Store
+
+# 构建产物与二进制
+*.exe
+uninstall.exe
+# 第三方二进制（README 附官方下载链接，不再分发）
+thirdparty/*
+!thirdparty/ftfix/
+!thirdparty/dump_server.py
+# 内部开发笔记
+MORNING_REPORT.md

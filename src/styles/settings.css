@@ -1,0 +1,213 @@
+/* 设置窗口（带系统边框的普通窗口，深色主题） */
+html,
+body {
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: #14141d;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.set-wrap {
+  padding: 18px 22px 26px;
+  color: #e8e8f0;
+}
+
+h1 {
+  font-size: 17px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  background: linear-gradient(90deg, #7ca6ff, #b57cff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  width: fit-content;
+}
+
+section {
+  margin-top: 18px;
+}
+
+h2 {
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.45);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 10px;
+}
+
+/* 分段选择卡 */
+.seg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.seg-card {
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #fff;
+  transition: background 0.18s, border-color 0.18s;
+}
+
+.seg-card b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.seg-card i {
+  display: block;
+  font-style: normal;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.42);
+  margin-top: 2px;
+}
+
+.seg-card:hover {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.seg-card.on {
+  background: rgba(124, 108, 255, 0.16);
+  border-color: rgba(124, 108, 255, 0.55);
+}
+
+/* 行 */
+.row {
+  margin: 12px 0;
+}
+
+.row-tight {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.row-label {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.85);
+  margin-bottom: 6px;
+}
+
+.row-tight .row-label {
+  margin-bottom: 0;
+}
+
+.row-label b {
+  color: rgba(255, 255, 255, 0.55);
+  font-weight: 500;
+  margin-left: 8px;
+}
+
+.row-label .hint {
+  font-style: normal;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.38);
+  margin-left: 6px;
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: #7c6cff;
+}
+
+select {
+  background: rgba(255, 255, 255, 0.07);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+/* 开关 */
+.switch {
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.switch input {
+  display: none;
+}
+
+.switch .track {
+  display: block;
+  width: 38px;
+  height: 22px;
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.14);
+  transition: background 0.2s;
+  cursor: pointer;
+}
+
+.switch .knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.2s;
+  cursor: pointer;
+}
+
+.switch input:checked + .track {
+  background: #7c6cff;
+}
+
+.switch input:checked ~ .knob,
+.switch input:checked + .track .knob {
+  transform: translateX(16px);
+}
+
+/* 让 knob 依据 input 状态移动：input 是 .track 的前兄弟 */
+.switch input:checked + .track .knob {
+  transform: translateX(16px);
+}
+
+.ghost-btn {
+  margin-top: 10px;
+  width: 100%;
+  padding: 9px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 12.5px;
+  transition: background 0.18s;
+}
+
+.ghost-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.nudge-row {
+  display: flex;
+  gap: 8px;
+}
+
+.ghost-btn.half {
+  margin-top: 0;
+  flex: 1;
+}
+
+footer {
+  margin-top: 24px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  font-size: 11px;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.35);
+}

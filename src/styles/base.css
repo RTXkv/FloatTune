@@ -1,0 +1,44 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  /* WebView2 157 透明合成：页面根完全透明（alpha=0）时整窗会被合成为
+     不透明灰底——极低不透明度（0.02）是保住透明合成的关键，视觉无感 */
+  background: rgba(0, 0, 0, 0.02);
+  overflow: hidden;
+}
+
+body {
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+button {
+  font-family: inherit;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+button svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+  display: block;
+}
+
+::-webkit-scrollbar {
+  display: none;
+}
+
+.dz {
+  cursor: move;
+}
