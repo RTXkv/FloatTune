@@ -31,7 +31,7 @@ fn throttle_save(app: &tauri::AppHandle) {
         LAST_POS_SAVE.store(now, std::sync::atomic::Ordering::Relaxed);
         let state = app.state::<AppState>();
         let dir = state.data_dir.clone();
-        let snap = state.settings.lock().unwrap().clone();
+        let snap = state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snap.save(&dir);
     }
 }
@@ -50,6 +50,25 @@ pub struct AppState {
 static WINDOW_REGIONS: std::sync::OnceLock<Mutex<HashMap<String, Vec<(f64, f64, f64, f64, u8)>>>> =
     std::sync::OnceLock::new();
 
+/// 各窗口“实际已应用”的穿透状态缓存。轮询线程用它去重（避免每 30ms 重复调用
+/// set_ignore_cursor_events）；dissolve/restore 在轮询线程之外改动真实状态时，
+/// 必须经 passthrough_note 同步，否则缓存失步会导致恢复后整窗拦截点击，
+/// 直到光标进出一次功能区才自愈。
+static PASSTHROUGH_LAST: std::sync::OnceLock<Mutex<HashMap<String, bool>>> =
+    std::sync::OnceLock::new();
+
+fn passthrough_last() -> &'static Mutex<HashMap<String, bool>> {
+    PASSTHROUGH_LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 记录某窗口穿透状态的最新实际值（轮询线程与 dissolve/restore 共用）
+pub fn passthrough_note(label: &str, ignore: bool) {
+    passthrough_last()
+        .lock()
+        .unwrap()
+        .insert(label.to_string(), ignore);
+}
+
 fn window_regions() -> &'static Mutex<HashMap<String, Vec<(f64, f64, f64, f64, u8)>>> {
     WINDOW_REGIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -59,7 +78,7 @@ fn update_strip_regions(
     window: String,
     rects: Vec<(f64, f64, f64, f64, u8)>,
 ) {
-    window_regions().lock().unwrap().insert(window, rects);
+    window_regions().lock().unwrap_or_else(|e| e.into_inner()).insert(window, rects);
 }
 
 fn spawn_region_passthrough(app: tauri::AppHandle) {
@@ -68,7 +87,6 @@ fn spawn_region_passthrough(app: tauri::AppHandle) {
     std::thread::Builder::new()
         .name("region-passthrough".into())
         .spawn(move || {
-            let mut last_ignore: HashMap<String, bool> = HashMap::new();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(30));
                 let locked = {
@@ -103,9 +121,15 @@ fn spawn_region_passthrough(app: tauri::AppHandle) {
                         })
                         .unwrap_or(true); // 未上报区域的窗口保持可交互
                     let ignore = locked || !hit;
-                    let changed = last_ignore.get(label) != Some(&ignore);
+                    let changed = {
+                        let mut m = passthrough_last().lock().unwrap_or_else(|e| e.into_inner());
+                        let changed = m.get(label) != Some(&ignore);
+                        if changed {
+                            m.insert(label.to_string(), ignore);
+                        }
+                        changed
+                    };
                     if changed {
-                        last_ignore.insert(label.to_string(), ignore);
                         let _ = w.set_ignore_cursor_events(ignore);
                     }
                 }
@@ -123,7 +147,7 @@ fn debug_log(msg: String) {
 pub fn apply_and_broadcast(app: &tauri::AppHandle) {
     let snap = {
         let state = app.state::<AppState>();
-        let cur = state.settings.lock().unwrap();
+        let cur = state.settings.lock().unwrap_or_else(|e| e.into_inner());
         cur.save(&state.data_dir);
         cur.clone()
     };
@@ -140,14 +164,14 @@ pub fn apply_and_broadcast(app: &tauri::AppHandle) {
 
 #[tauri::command]
 fn get_settings(state: tauri::State<AppState>) -> Settings {
-    state.settings.lock().unwrap().clone()
+    state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[tauri::command]
 fn set_settings(app: tauri::AppHandle, state: tauri::State<AppState>, settings: Settings) {
     let autostart_changed;
     {
-        let mut cur = state.settings.lock().unwrap();
+        let mut cur = state.settings.lock().unwrap_or_else(|e| e.into_inner());
         autostart_changed = cur.autostart != settings.autostart;
         // 位置记忆由窗口拖动维护，设置窗口不动它
         let mut new = settings;
@@ -156,7 +180,7 @@ fn set_settings(app: tauri::AppHandle, state: tauri::State<AppState>, settings: 
     }
     if autostart_changed {
         use tauri_plugin_autostart::ManagerExt;
-        let on = state.settings.lock().unwrap().autostart;
+        let on = state.settings.lock().unwrap_or_else(|e| e.into_inner()).autostart;
         let al = app.autolaunch();
         let _ = if on { al.enable() } else { al.disable() };
     }
@@ -165,7 +189,7 @@ fn set_settings(app: tauri::AppHandle, state: tauri::State<AppState>, settings: 
 
 #[tauri::command]
 fn get_state(state: tauri::State<AppState>) -> TrackSnapshot {
-    state.snapshot.lock().unwrap().clone()
+    state.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[tauri::command]
@@ -195,7 +219,7 @@ async fn fetch_lyrics(
 fn set_clickthrough(app: tauri::AppHandle, on: bool) {
     {
         let state = app.state::<AppState>();
-        state.settings.lock().unwrap().clickthrough_lock = on;
+        state.settings.lock().unwrap_or_else(|e| e.into_inner()).clickthrough_lock = on;
     }
     apply_and_broadcast(&app);
 }
@@ -204,7 +228,7 @@ fn set_clickthrough(app: tauri::AppHandle, on: bool) {
 fn reposition(app: tauri::AppHandle) {
     {
         let state = app.state::<AppState>();
-        let mut s = state.settings.lock().unwrap();
+        let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
         let mode = s.mode.clone();
         s.positions.remove(&mode);
     }
@@ -226,7 +250,29 @@ fn quit_app(app: tauri::AppHandle) {
 
 // ---------- 启动 ----------
 
+/// 数据目录（panic hook 用，避免依赖 AppState）
+fn dirs_data_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("com.floatune.app"))
+}
+
 pub fn run() {
+    // panic 落盘：stderr 可能连不到终端（直接启动的 exe），独立文件保证有证据
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!(
+            "[panic] {} thread={:?}\n",
+            info,
+            std::thread::current().id()
+        );
+        eprintln!("{}", msg);
+        if let Some(dir) = dirs_data_dir() {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("crash.log"))
+                .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+        }
+    }));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -311,7 +357,7 @@ pub fn run() {
                             return;
                         }
                         let state = h2.state::<AppState>();
-                        let mut s = state.settings.lock().unwrap();
+                        let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
                         let e = s.positions.entry(l.clone()).or_insert_with(|| vec![0.0; 4]);
                         if e.len() < 4 {
                             e.resize(4, 0.0);
@@ -327,7 +373,7 @@ pub fn run() {
                             return;
                         }
                         let state = h2.state::<AppState>();
-                        let mut s = state.settings.lock().unwrap();
+                        let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
                         let e = s.positions.entry(l.clone()).or_insert_with(|| vec![0.0; 4]);
                         if e.len() < 4 {
                             e.resize(4, 0.0);

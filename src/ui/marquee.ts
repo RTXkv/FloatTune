@@ -68,8 +68,7 @@ export function restartLyricScroll(el: HTMLElement, durMs: number): void {
   const overflowing = dist > 8;
   el.classList.toggle("lyr-anim", overflowing);
   if (!overflowing) {
-    el.style.animation = "none";
-    el.style.setProperty("--lyr-end", "0px");
+    stopLyricScroll(el);
     return;
   }
   el.style.setProperty("--lyr-end", `${-dist}px`);
@@ -77,4 +76,15 @@ export function restartLyricScroll(el: HTMLElement, durMs: number): void {
   el.style.animation = "none";
   void el.offsetWidth;
   el.style.animation = `lyricScroll ${Math.max(2000, Math.round(durMs * 0.65))}ms linear 0.3s forwards`;
+}
+
+/**
+ * 停止滚动并复位变换。切歌/纯音乐时必须显式调用：fill:forwards 的
+ * lyricScroll 动画完成后会把 transform 钉在终点 --lyr-end 上，
+ * 不复位的话新内容（如纯音乐颜文字）会被顶到卡片边缘。
+ */
+export function stopLyricScroll(el: HTMLElement): void {
+  el.classList.remove("lyr-anim");
+  el.style.animation = "none";
+  el.style.setProperty("--lyr-end", "0px");
 }

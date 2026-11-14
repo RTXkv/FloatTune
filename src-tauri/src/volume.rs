@@ -2,31 +2,47 @@
 //!
 //! 走 Windows Core Audio：枚举默认渲染设备的音频会话，
 //! 找到属于 cloudmusic.exe 的会话，设置其 ISimpleAudioVolume。
+//!
+//! 本模块由 SMTC 快路径线程每 ~120ms 调用一次（smtc.rs），因此：
+//! - 进程句柄用 win32::ProcessHandle RAII 包装，杜绝 OpenProcess 句柄泄漏；
+//! - COM 每线程只初始化一次（线程与应用等长，无需 CoUninitialize）；
+//! - COM 对象（枚举器/设备/会话管理器）仍每次重建：开销为微秒级，
+//!   而跨调用缓存会在用户切换默认音频设备后失效（陈旧句柄），得不偿失。
 
+use crate::win32::ProcessHandle;
 use windows::core::{Interface, PWSTR};
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Media::Audio::{
     eMultimedia, eRender, IAudioSessionEnumerator, IAudioSessionManager2, IMMDeviceEnumerator,
 };
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
-};
-use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
 use windows::core::GUID;
 
 /// CLSID_MMDeviceEnumerator（windows crate 未生成该常量，手动定义）
 const CLSID_MMDEVICE_ENUMERATOR: GUID =
     GUID::from_u128(0xbcde0395_e52f_467c_8e3d_c4579291692e);
 
+/// COM 初始化：每线程一次（重复 CoInitializeEx 即便返回 S_FALSE 也需要
+/// 配对 CoUninitialize，高频轮询路径反复 init/uninit 纯属浪费）。
+fn ensure_com_initialized() {
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !DONE.with(std::cell::Cell::get) {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        DONE.with(|c| c.set(true));
+    }
+}
+
 fn pid_process_name(pid: u32) -> Option<String> {
+    let handle = ProcessHandle::open(pid)?;
     unsafe {
-        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
         QueryFullProcessImageNameW(
-            handle,
+            handle.0,
             PROCESS_NAME_WIN32,
             PWSTR(buf.as_mut_ptr()),
             &mut len,
@@ -46,8 +62,8 @@ fn pid_process_name(pid: u32) -> Option<String> {
 /// 返回 None = 找不到网易云的会话
 pub fn cloudmusic_session_inactive() -> Option<bool> {
     use windows::Win32::Media::Audio::AudioSessionStateActive;
+    ensure_com_initialized();
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&CLSID_MMDEVICE_ENUMERATOR, None, CLSCTX_ALL).ok()?;
         let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;

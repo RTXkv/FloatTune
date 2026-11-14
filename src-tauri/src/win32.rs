@@ -1,15 +1,38 @@
-//! Win32 杂项：任务栏定位、前台全屏检测
+//! Win32 杂项：任务栏定位、前台全屏检测、进程句柄 RAII
 
 use std::time::Duration;
 use tauri::Emitter;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetWindowRect,
 };
+
+/// RAII 进程句柄：离开作用域自动 CloseHandle。
+/// 此前 OpenProcess 的句柄从不释放，快路径每 120ms 轮询一次，
+/// 长时间运行句柄数持续增长（且 `?` 提前返回路径同样泄漏）。
+pub struct ProcessHandle(pub HANDLE);
+
+impl ProcessHandle {
+    /// OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + RAII 包装
+    pub fn open(pid: u32) -> Option<Self> {
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok().map(Self) }
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 /// 主任务栏（Shell_TrayWnd）的屏幕矩形；Win11 新任务栏可能返回无效矩形，
 /// 所以做尺寸校验，无效则返回 None（由调用方按主屏底部兜底）
@@ -115,9 +138,9 @@ pub fn spawn_fullscreen_watcher(app: tauri::AppHandle) {
                 {
                     use tauri::Manager;
                     let st = app.state::<crate::AppState>();
-                    let s = st.settings.lock().unwrap().clone();
+                    let s = st.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let fs = st.fullscreen.load(std::sync::atomic::Ordering::Relaxed);
-                    let playing = st.snapshot.lock().unwrap().status == "playing";
+                    let playing = st.snapshot.lock().unwrap_or_else(|e| e.into_inner()).status == "playing";
                     let should_show =
                         (!s.show_only_playing || playing) && (!s.hide_fullscreen || !fs);
                     drop(st);
@@ -145,8 +168,7 @@ pub fn netease_window_title() -> Option<String> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{LPARAM, HWND};
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowTextW,
@@ -165,12 +187,11 @@ pub fn netease_window_title() -> Option<String> {
             return BOOL(1);
         }
         let exe = ctx.pids.entry(pid).or_insert_with(|| {
-            let name = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-                .ok()
+            ProcessHandle::open(pid)
                 .and_then(|h| {
                     let mut buf = [0u16; 1024];
                     let mut len = buf.len() as u32;
-                    QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+                    QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
                         .ok()?;
                     Some(
                         String::from_utf16_lossy(&buf[..len as usize])
@@ -180,8 +201,7 @@ pub fn netease_window_title() -> Option<String> {
                             .to_lowercase(),
                     )
                 })
-                .unwrap_or_default();
-            name
+                .unwrap_or_default()
         });
         if exe != "cloudmusic.exe" {
             return BOOL(1);

@@ -39,3 +39,7 @@ windows = { version = "0.58", features = [
 opt-level = "s"
 lto = true
 strip = true
+
+[features]
+# 生产构建必须启用（嵌入前端资源）；dev 由 tauri CLI 自动关闭。DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]

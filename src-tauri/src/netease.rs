@@ -300,7 +300,7 @@ pub async fn fetch_lyrics_full(
                 TrackKey { song_id: sid, duration_ms: dur, pic_url: pic.clone() },
             );
             save_trackmap(dir, &map);
-            *key.lock().unwrap() = map.clone();
+            *key.lock().unwrap_or_else(|e| e.into_inner()) = map.clone();
             (sid, dur, pic)
         }
     };

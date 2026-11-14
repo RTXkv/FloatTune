@@ -17,7 +17,7 @@ fn check(
 /// 组装托盘菜单（根据当前设置勾选）
 pub fn build_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let state: tauri::State<AppState> = app.state();
-    let s = state.settings.lock().unwrap().clone();
+    let s = state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     let m_strip = check(app, "mode-strip", "极简浮窗 · 一行歌词", s.mode == "strip")?;
     let m_card = check(app, "mode-card", "全览浮窗 · 封面卡片", s.mode == "card")?;
@@ -100,7 +100,7 @@ fn handle_menu(app: &tauri::AppHandle, id: &str) {
 
     {
         let state: tauri::State<AppState> = app.state();
-        let mut s = state.settings.lock().unwrap();
+        let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
         match id {
             "mode-strip" | "mode-card" => {
                 s.mode = id.trim_start_matches("mode-").to_string();

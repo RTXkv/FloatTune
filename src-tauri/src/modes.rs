@@ -111,9 +111,13 @@ pub fn show_mode(app: &AppHandle, mode: &str, settings: &Settings) -> Result<(),
     crate::visibility::mark_onscreen(mode);
     eprintln!("[modes] show_mode {} end tid={:?}", mode, std::thread::current().id());
     let _ = win.set_ignore_cursor_events(settings.clickthrough_lock);
+    // 同步分区穿透线程的缓存（mark_onscreen 后轮询恢复，需告知实际值）
+    crate::passthrough_note(mode, settings.clickthrough_lock);
     // 恢复透明度（淡出可能把 inline opacity 置 0；直接注入 JS 兜底，不依赖事件）
     let _ = win.eval("var a=document.getElementById('app'); if(a) a.style.opacity='';");
+    // 只定向当前形态窗口：全局广播会让刚被 dissolve 的其他窗口收到 vis=true
+    // 恢复 opacity，出现幽灵显示
     use tauri::Emitter;
-    let _ = app.emit("vis", true);
+    let _ = app.emit_to(mode, "vis", true);
     Ok(())
 }

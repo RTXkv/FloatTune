@@ -4,7 +4,7 @@ import { store } from "../core/store";
 import { PositionClock, fmtTime } from "../core/clock";
 import { loadLyrics, currentLineIndex, LyricLine } from "../core/lyrics";
 import { renderKaraoke, currentKaraokeIndex, KaraokeLine } from "../core/karaoke";
-import { restartLyricScroll } from "./marquee";
+import { restartLyricScroll, stopLyricScroll } from "./marquee";
 import { marqueeSetPlaying } from "./marquee";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -176,7 +176,7 @@ export function mountCard() {
   // 暂停/播放 → 渐隐/渐显（Rust 决策，前端只做动画）
   void listen<boolean>("vis", (e) => {
     const el = document.getElementById("app");
-    // 渐隐到 0.004（Rust 延迟后收缩 1x1；恢复时淡回）。
+    // 两段式隐藏的前半段：淡出到 0.004（Rust 在 480ms 后 hide 窗口；恢复时淡回）。
     // 实测低 alpha 不锁存——之前的锁存结论是 toggle 丢包导致的误判。
     if (el) el.style.opacity = e.payload ? "" : "0.004";
     if (e.payload) setTimeout(() => reportRegions(), 120);
@@ -281,6 +281,9 @@ export function mountCard() {
     apiCover = "";
     lastLyricIdx = -2;
     idleMark = KAOMOJI[Math.floor(Math.random() * KAOMOJI.length)];
+    // 清掉上一首长句的 lyricScroll 残留（forwards 填充会把 transform 钉在
+    // 滚动终点，不复位的话纯音乐颜文字会被顶到卡片边缘）
+    stopLyricScroll(lineCur);
     lineCur.textContent = idleMark;
     lineNxt.textContent = "";
     if (s.lyric_style !== "off" && t.title) {
@@ -475,8 +478,9 @@ export function mountCard() {
   setInterval(() => {
     const t = store.track;
     if (!t) return;
-    // 暂停时把进度回吸到最后一个真实位置（InfLink 停止推送前的那一下）
-    if (t.status !== "playing" && lastRealPos >= 0 && lastRealApplied !== lastRealPos) {
+    // 暂停时把进度回吸到最后一个真实位置（InfLink 停止推送前的那一下）；
+    // timeline 已失效（InfLink 掉线）时不回吸，防止吸到残留位置
+    if (t.status !== "playing" && t.timeline_valid && lastRealPos >= 0 && lastRealApplied !== lastRealPos) {
       clock.calibrate(lastRealPos);
       lastRealApplied = lastRealPos;
     }

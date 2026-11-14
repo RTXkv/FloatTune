@@ -60,6 +60,45 @@ pub struct TrackSnapshot {
 const TRACK_GAP_SUPPRESS_MS: u64 = 2500;
 /// 决策循环周期
 const TICK_MS: u64 = 120;
+/// SMTC 采样缓存的过期阈值：超过视为不可信（回退音频会话判定）。
+/// GetTimelineProperties 是跨进程 RPC 到网易云，InfLink 挂起时会永久阻塞——
+/// 所以 SMTC 采样必须在独立线程，决策循环只消费带时间戳的缓存。
+const SAMPLE_STALE_MS: u128 = 600;
+/// InfLink 推送停滞判死阈值：播放中（会话 Active）timeline 连续无推进的 tick 数
+/// （40 × 120ms ≈ 4.8s）。网易云 SMTC 的 timeline 有残留值，只看 dur>0 会误判在位。
+const INFLINK_STALE_TICKS: u32 = 40;
+
+/// SMTC 采样快照（独立线程写入，决策循环读取）
+#[derive(Clone)]
+struct SmtcSample {
+    at: Instant,
+    raw: Option<String>,
+    /// (pos, dur)，dur>0 才有效
+    tl: Option<(u64, u64)>,
+}
+
+/// 后台采样线程：把可能阻塞的 WinRT 调用（raw 状态 + timeline）隔离在独立线程，
+/// 卡死也只影响采样新鲜度，不拖垮决策循环（快慢分离原则的落地）。
+fn spawn_sampler(
+    manager: GlobalSystemMediaTransportControlsSessionManager,
+    sample: Arc<Mutex<SmtcSample>>,
+) {
+    std::thread::Builder::new()
+        .name("smtc-sample".into())
+        .spawn(move || loop {
+            let raw = smtc_raw_status(&manager);
+            let tl = find_media_session(&manager).and_then(|s| s.GetTimelineProperties().ok()).and_then(|t| {
+                let pos = t.Position().map(|v| (v.Duration.max(0) as u64) / 10_000).unwrap_or(0);
+                let dur = t.EndTime().map(|v| (v.Duration.max(0) as u64) / 10_000).unwrap_or(0);
+                if dur > 0 { Some((pos, dur)) } else { None }
+            });
+            if let Ok(mut s) = sample.lock() {
+                *s = SmtcSample { at: Instant::now(), raw, tl };
+            }
+            std::thread::sleep(Duration::from_millis(TICK_MS));
+        })
+        .expect("spawn smtc sampler");
+}
 
 /// 读取封面并转为 data URL（可能耗时/挂起，只在后台线程调用）
 fn fetch_cover(
@@ -130,12 +169,23 @@ fn watch(app: tauri::AppHandle, rx: Receiver<MediaCommand>, snapshot: Arc<Mutex<
             .ok()
             .and_then(|op| op.get().ok());
 
+    // SMTC 采样（独立线程）：raw 状态 + timeline，决策循环只读缓存
+    let sample = Arc::new(Mutex::new(SmtcSample {
+        at: Instant::now() - Duration::from_secs(60),
+        raw: None,
+        tl: None,
+    }));
+    if let Some(m) = manager.clone() {
+        spawn_sampler(m, sample.clone());
+    }
+
     let cover_busy = Arc::new(AtomicBool::new(false));
 
     let mut last_title_key: Option<(String, String)> = None;
     let mut last_status = String::new();
     let mut inflink = false;
-    let mut last_tl = (0u64, 0u64);
+    let mut last_tl_pos: u64 = 0;
+    let mut stale_ticks: u32 = 0;
     let mut title_changed_at = Instant::now() - Duration::from_secs(60);
     let mut tick: u64 = 0;
 
@@ -143,27 +193,27 @@ fn watch(app: tauri::AppHandle, rx: Receiver<MediaCommand>, snapshot: Arc<Mutex<
         // 1. 控制指令：非阻塞取出，后台线程处理（SMTC 可能卡，不拖累循环）
         while let Ok(cmd) = rx.try_recv() {
             let m = manager.clone();
-            // 记录当前标题供切歌验证
-            if let Some(mm) = m.as_ref() {
-                if let Some(props) =
-                    find_media_session(mm).and_then(|s| s.TryGetMediaPropertiesAsync().and_then(|o| o.get()).ok())
-                {
-                    let t = props.Title().map(|x| x.to_string()).unwrap_or_default();
-                    TITLE_BEFORE.with(|c| *c.borrow_mut() = t);
-                }
-            }
             std::thread::Builder::new()
                 .name("media-cmd".into())
                 .spawn(move || handle_command(m.as_ref(), cmd))
                 .ok();
         }
 
-        // 2. 快路径采样：窗口标题（Win32）+ 音频会话（CoreAudio）+ SMTC raw（同步属性）
+        // 2. 快路径采样：窗口标题（Win32）+ 音频会话（CoreAudio）+ SMTC 采样缓存
         let raw_title = crate::win32::netease_window_title();
         let inactive = crate::volume::cloudmusic_session_inactive();
-        let smtc_raw = manager
-            .as_ref()
-            .and_then(smtc_raw_status);
+        let (smtc_raw, tl_now) = {
+            let s = sample
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if s.at.elapsed().as_millis() <= SAMPLE_STALE_MS {
+                (s.raw, s.tl)
+            } else {
+                // 采样线程卡死（网易云 SMTC 端挂起）：数据过期，回退音频会话判定
+                (None, None)
+            }
+        };
 
         // 3. 状态判定（自适应）：
         //    - InfLink 在位（timeline 有效）：raw 即时可信，直接采用
@@ -218,51 +268,74 @@ fn watch(app: tauri::AppHandle, rx: Receiver<MediaCommand>, snapshot: Arc<Mutex<
                 start.elapsed().as_millis()
             );
             {
-                let mut snap = snapshot.lock().unwrap();
+                let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
                 snap.status = effective.clone();
                 snap.status_changed_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
             }
-            let snap = snapshot.lock().unwrap().clone();
+            let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let _ = app.emit("smtc:status", &snap);
             crate::visibility::update_visibility(&app);
             last_status = effective.clone();
         }
 
-        // 4.5 InfLink timeline：原生网易云恒空；出现即 InfLink 在位（状态转用 raw）
-        if let Some(m) = manager.as_ref() {
-            if let Some(session) = find_media_session(m) {
-                if let Ok(tl) = session.GetTimelineProperties() {
-                    let pos = tl.Position().map(|v| (v.Duration.max(0) as u64) / 10_000).unwrap_or(0);
-                    let dur = tl.EndTime().map(|v| (v.Duration.max(0) as u64) / 10_000).unwrap_or(0);
-                    if dur > 0 {
-                        if !inflink {
-                            inflink = true;
-                            eprintln!("[smtc] InfLink detected (timeline available)");
-                        }
-                        if (pos, dur) != last_tl {
-                            last_tl = (pos, dur);
-                            {
-                                let mut snap = snapshot.lock().unwrap();
-                                snap.timeline_valid = true;
-                                snap.position_ms = pos;
-                                snap.duration_ms = dur;
-                            }
-                            let _ = app.emit("smtc:timeline", (pos, dur));
-                        }
-                    } else if inflink {
-                        inflink = false;
-                        {
-                            let mut snap = snapshot.lock().unwrap();
-                            snap.timeline_valid = false;
-                        }
-                        let snap = snapshot.lock().unwrap().clone();
-                        let _ = app.emit("smtc:status", &snap);
-                    }
+        // 4.5 InfLink 判定：激活需要 timeline **推进**（网易云残留 timeline 恒值，
+        // 只看 dur>0 会误判在位 → 信任 11-20s 延迟的 raw，正是响应慢的根因）；
+        // 播放中（会话 Active）timeline 停滞 ~5s 判死 → 回退音频会话路径。
+        if let Some((pos, dur)) = tl_now {
+            let moved = pos != last_tl_pos;
+            if !inflink {
+                if moved {
+                    inflink = true;
+                    stale_ticks = 0;
+                    eprintln!("[smtc] InfLink detected (timeline advancing)");
                 }
+            } else if moved {
+                stale_ticks = 0;
+            } else if inactive == Some(false) {
+                // 真的在出声但 timeline 不动：推送端挂起
+                stale_ticks += 1;
+                if stale_ticks >= INFLINK_STALE_TICKS {
+                    inflink = false;
+                    stale_ticks = 0;
+                    eprintln!(
+                        "[smtc] InfLink push stalled (timeline frozen ~{}s while playing), falling back",
+                        (INFLINK_STALE_TICKS * TICK_MS as u32) / 1000
+                    );
+                    {
+                        let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                        snap.timeline_valid = false;
+                    }
+                    let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let _ = app.emit("smtc:status", &snap);
+                }
+            } else {
+                // 暂停中 timeline 不动是正常的，不计时
+                stale_ticks = 0;
             }
+            if inflink && moved {
+                {
+                    let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                    snap.timeline_valid = true;
+                    snap.position_ms = pos;
+                    snap.duration_ms = dur;
+                }
+                let _ = app.emit("smtc:timeline", (pos, dur));
+            }
+            last_tl_pos = pos;
+        } else if inflink {
+            // timeline 消失（会话关闭/SMTC 端清空）
+            inflink = false;
+            stale_ticks = 0;
+            eprintln!("[smtc] InfLink lost (timeline gone)");
+            {
+                let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                snap.timeline_valid = false;
+            }
+            let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let _ = app.emit("smtc:status", &snap);
         }
 
         // 5. 曲目差分（窗口标题 "歌名 - 歌手"）
@@ -278,13 +351,13 @@ fn watch(app: tauri::AppHandle, rx: Receiver<MediaCommand>, snapshot: Arc<Mutex<
                         start.elapsed().as_millis()
                     );
                     {
-                        let mut snap = snapshot.lock().unwrap();
+                        let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
                         snap.title = title;
                         snap.artist = artist;
                         snap.album.clear();
                         snap.source = "cloudmusic".into();
                     }
-                    let snap = snapshot.lock().unwrap().clone();
+                    let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let _ = app.emit("smtc:track", &snap);
                     last_title_key = Some(key);
 
@@ -387,21 +460,21 @@ fn kick_cover(
                 if let Some(props) = props {
                     if let Ok(cov) = fetch_cover(&props) {
                         {
-                            let mut s = snapshot.lock().unwrap();
+                            let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
                             s.cover_b64 = Some(cov);
                         }
-                        let s = snapshot.lock().unwrap().clone();
+                        let s = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let _ = app.emit("smtc:track", &s);
                         break;
                     }
                 }
                 if attempt == 4 {
                     // 放弃：置 None 让前端走 API 封面兜底
-                    let mut s = snapshot.lock().unwrap();
+                    let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
                     if s.cover_b64.is_none() {
                         s.cover_b64 = None;
                     }
-                    let s = snapshot.lock().unwrap().clone();
+                    let s = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let _ = app.emit("smtc:track", &s);
                 }
                 std::thread::sleep(Duration::from_millis(1200));
@@ -475,6 +548,15 @@ fn handle_command(
 ) {
     // InfLink 的 SMTC 转发实测会丢命令（返回 True 但无效果），
     // 所以每条指令都带"验证 + 媒体键补发"。
+    // 记录当前标题供切歌验证（本线程可能阻塞，与决策循环隔离）
+    if let Some(m) = manager {
+        if let Some(props) =
+            find_media_session(m).and_then(|s| s.TryGetMediaPropertiesAsync().and_then(|o| o.get()).ok())
+        {
+            let t = props.Title().map(|x| x.to_string()).unwrap_or_default();
+            TITLE_BEFORE.with(|c| *c.borrow_mut() = t);
+        }
+    }
     let Some(m) = manager else {
         send_media_key(match cmd {
             MediaCommand::PlayPause => VK_MEDIA_PLAY_PAUSE,
