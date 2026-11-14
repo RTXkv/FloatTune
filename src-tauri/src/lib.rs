@@ -208,13 +208,22 @@ async fn fetch_lyrics(
     title: String,
     artist: String,
     duration_ms: Option<u64>,
+    song_id: Option<u64>,
 ) -> Result<netease::LyricPayload, String> {
     let state = app.state::<AppState>();
     let dir = state.data_dir.clone();
     // 共享客户端：连接池跨请求复用
     let client = netease::shared_client();
-    netease::fetch_lyrics_full(client, &dir, &title, &artist, duration_ms, &state.lyric_key_cache)
-        .await
+    netease::fetch_lyrics_full(
+        client,
+        &dir,
+        &title,
+        &artist,
+        duration_ms,
+        song_id,
+        &state.lyric_key_cache,
+    )
+    .await
 }
 
 #[tauri::command]

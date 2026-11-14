@@ -58,6 +58,10 @@ pub struct TrackSnapshot {
     /// 代际一致，防止旧歌的慢结果覆盖新歌状态
     #[serde(default)]
     pub track_generation: u64,
+    /// InfLink 提供的网易云歌曲精确 ID（genre 字段 NCM-{ID}）。
+    /// 在位时歌词管线跳过搜索匹配直接按 ID 拉取，根除同名误配
+    #[serde(default)]
+    pub song_id: Option<u64>,
 }
 
 /// 切歌间隙：标题刚变过时静音不算暂停
@@ -397,6 +401,7 @@ fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
                         // 纯音乐时前端没有 API 封面兜底，必须靠这里清干净）
                         snap.cover_b64 = None;
                         snap.source = "cloudmusic".into();
+                        snap.song_id = None;
                         // timeline 还是上一首的残留值：立即失效，等新歌的第一次推送
                         // 再置有效（防止歌词匹配用旧歌时长打分误伤）
                         snap.timeline_valid = false;
@@ -487,6 +492,22 @@ fn norm_loose(s: &str) -> String {
         .collect()
 }
 
+/// 从 SMTC 元数据 genre 字段提取 InfLink 的歌曲 ID（格式 NCM-{ID}）
+fn extract_ncm_id(
+    props: &GlobalSystemMediaTransportControlsSessionMediaProperties,
+) -> Option<u64> {
+    let genres = props.Genres().ok()?;
+    for g in genres {
+        let s = g.to_string();
+        if let Some(rest) = s.strip_prefix("NCM-") {
+            if let Ok(id) = rest.trim().parse::<u64>() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 /// 后台单飞取封面：SMTC 元数据请求可能卡数秒，完全隔离在独立线程
 fn kick_cover(
     app: &tauri::AppHandle,
@@ -536,6 +557,15 @@ fn kick_cover(
                         .clone();
                     let stale = norm_loose(&ptitle) != norm_loose(&cur_title);
                     if !stale {
+                        // 元数据已跟上当前歌：提取 InfLink 歌曲精确 ID（genre 字段
+                        // NCM-{ID}），供歌词管线跳过搜索匹配
+                        if let Some(sid) = extract_ncm_id(&props) {
+                            eprintln!("[smtc] InfLink song_id={} extracted", sid);
+                            let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                            if s.track_generation == gen {
+                                s.song_id = Some(sid);
+                            }
+                        }
                         if let Ok(cov) = fetch_cover(&props) {
                             {
                                 let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
@@ -732,4 +762,54 @@ fn verify_changed(
 
 thread_local! {
     static TITLE_BEFORE: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_simple_title() {
+        assert_eq!(
+            parse_window_title("晴天 - 周杰伦"),
+            Some(("晴天".into(), "周杰伦".into()))
+        );
+    }
+
+    #[test]
+    fn title_with_dash_splits_at_last() {
+        // 歌名自身含 " - "：以最后一个分割，歌手仍在最后
+        assert_eq!(
+            parse_window_title("NHK - 拾歌曲 - 某歌手"),
+            Some(("NHK - 拾歌曲".into(), "某歌手".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_client_self_title() {
+        assert_eq!(parse_window_title("网易云音乐"), None);
+        assert_eq!(parse_window_title(""), None);
+    }
+
+    #[test]
+    fn no_dash_means_title_only() {
+        assert_eq!(
+            parse_window_title("纯歌名"),
+            Some(("纯歌名".into(), String::new()))
+        );
+    }
+
+    #[test]
+    fn norm_loose_ignores_whitespace_and_case() {
+        assert_eq!(norm_loose("A B c"), norm_loose("abc"));
+        assert_ne!(norm_loose("a"), norm_loose("b"));
+    }
+
+    #[test]
+    fn ncm_id_format_roundtrip() {
+        // extract_ncm_id 需要 WinRT 对象，测格式解析等价逻辑
+        let raw = "NCM-2309212";
+        let parsed = raw.strip_prefix("NCM-").and_then(|r| r.trim().parse::<u64>().ok());
+        assert_eq!(parsed, Some(2309212));
+    }
 }

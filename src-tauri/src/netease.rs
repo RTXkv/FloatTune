@@ -31,6 +31,89 @@ pub fn shared_client() -> &'static NeteaseClient {
     SHARED_CLIENT.get_or_init(NeteaseClient::new)
 }
 
+/// 歌名归一：去空白/常见标点 + 小写。
+/// （"晴天 Live" vs "晴天 (Live)" 的括号差异不应破坏精确匹配）
+fn norm_title(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    '(' | ')' | '（' | '）' | '[' | ']' | '【' | '】' | '-' | '－' | '·' | '～' | '~'
+                )
+        })
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 匹配打分（纯函数，可测试）。
+/// 特征：歌名精确/包含、歌手集合精确匹配、时长差、版本差异词。
+fn score_candidate(
+    cand_name: &str,
+    cand_artists: &[String],
+    cand_duration_ms: u64,
+    query_title: &str,
+    query_artist_tokens: &[String],
+    query_duration_ms: Option<u64>,
+) -> i32 {
+    let nt = norm_title(query_title);
+    let sn = norm_title(cand_name);
+    let mut sc = 0;
+    if sn == nt {
+        sc += 100;
+    } else if sn.contains(&nt) || nt.contains(&sn) {
+        sc += 40;
+    }
+
+    // 歌手：候选歌手名与查询 token **互相精确**匹配（防"周杰伦"误配
+    // "周杰伦Cover"），全中加分，一无所中重罚
+    let cand_artists_n: Vec<String> = cand_artists
+        .iter()
+        .map(|a| norm(a))
+        .filter(|n| !n.is_empty())
+        .collect();
+    let mut matched = 0usize;
+    for t in query_artist_tokens {
+        if cand_artists_n.iter().any(|c| c == t) {
+            matched += 1;
+        }
+    }
+    if matched > 0 {
+        sc += 30 * matched as i32;
+        if matched == query_artist_tokens.len() {
+            sc += 15;
+        }
+    } else if !query_artist_tokens.is_empty() {
+        sc -= 50;
+    }
+
+    // 时长特征：InfLink 在位时有真实歌曲时长
+    if let Some(cur) = query_duration_ms {
+        if cand_duration_ms > 0 {
+            let diff = (cand_duration_ms as i64 - cur as i64).abs();
+            if diff <= 2000 {
+                sc += 120;
+            } else if diff <= 5000 {
+                sc += 60;
+            } else if diff > 15_000 {
+                sc -= 80;
+            }
+        }
+    }
+
+    // 版本差异词：候选是 Live/伴奏/翻唱而查询没提 → 惩罚
+    let query_has_marker = VERSION_MARKERS.iter().any(|m| nt.contains(m));
+    if !query_has_marker {
+        let marker_hit = VERSION_MARKERS
+            .iter()
+            .any(|m| sn.contains(m) || cand_artists_n.iter().any(|c| c.contains(m)));
+        if marker_hit {
+            sc -= 60;
+        }
+    }
+    sc
+}
+
 /// 搜索失败分类：网络问题（前端可重试）vs 无高置信结果（不重试）
 pub enum ResolveFail {
     Net(String),
@@ -158,59 +241,14 @@ impl NeteaseClient {
             .collect();
 
         let score = |s: &SearchSong| -> i32 {
-            let mut sc = 0;
-            let sn = norm(&s.name);
-            if sn == nt {
-                sc += 100;
-            } else if sn.contains(&nt) || nt.contains(&sn) {
-                sc += 40;
-            }
-
-            // 歌手：候选歌手名与查询 token **互相精确**匹配（防"周杰伦"误配
-            // "周杰伦Cover"），全中加分，一无所中重罚
-            let cand_artists: Vec<String> =
-                s.artists.iter().map(|a| norm(&a.name)).filter(|n| !n.is_empty()).collect();
-            let mut matched = 0usize;
-            for t in &artist_tokens {
-                if cand_artists.iter().any(|c| c == t) {
-                    matched += 1;
-                }
-            }
-            if matched > 0 {
-                sc += 30 * matched as i32;
-                if matched == artist_tokens.len() {
-                    sc += 15; // 查询歌手全部命中
-                }
-            } else {
-                sc -= 50; // 歌手完全不沾边：大概率同名不同人
-            }
-
-            // 时长特征：InfLink 在位时有真实歌曲时长
-            if let Some(cur) = current_duration_ms {
-                if s.duration > 0 {
-                    let diff = (s.duration as i64 - cur as i64).abs();
-                    if diff <= 2000 {
-                        sc += 120;
-                    } else if diff <= 5000 {
-                        sc += 60;
-                    } else if diff > 15_000 {
-                        sc -= 80;
-                    }
-                }
-            }
-
-            // 版本差异词：候选是 Live/伴奏/翻唱而查询没提 → 惩罚
-            let query_has_marker = VERSION_MARKERS.iter().any(|m| nt.contains(m));
-            if !query_has_marker {
-                let marker_hit = VERSION_MARKERS.iter().any(|m| {
-                    sn.contains(m)
-                        || cand_artists.iter().any(|c| c.contains(m))
-                });
-                if marker_hit {
-                    sc -= 60;
-                }
-            }
-            sc
+            score_candidate(
+                &s.name,
+                &s.artists.iter().map(|a| a.name.clone()).collect::<Vec<_>>(),
+                s.duration,
+                title,
+                &artist_tokens,
+                current_duration_ms,
+            )
         };
 
         let mut best = songs.clone();
@@ -390,7 +428,31 @@ fn lyric_cache_path(dir: &PathBuf, id: u64) -> PathBuf {
     dir.join("lyrics").join(format!("{id}.json"))
 }
 
-/// 完整管线：内存映射缓存 → 磁盘映射缓存 → 搜索 → 歌词 → 落盘。
+/// 原子写：临时文件 + rename 替换（进程被杀不留截断文件）
+fn atomic_write(path: &std::path::Path, data: &str) {
+    let tmp = path.with_extension("tmp");
+    if let Err(e) = fs::write(&tmp, data) {
+        eprintln!("[netease] 缓存写入失败 {}: {}", path.display(), e);
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        eprintln!("[netease] 缓存替换失败 {}: {}", path.display(), e);
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// 内存 payload 缓存 + 全局请求闸门：并发请求（两个窗口同时请求同一首歌）
+/// 在闸门上排队，后到者命中内存缓存直接返回，避免重复网络请求
+static FETCH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static PAYLOAD_MEM: std::sync::OnceLock<Mutex<HashMap<String, LyricPayload>>> =
+    std::sync::OnceLock::new();
+
+fn payload_mem() -> &'static Mutex<HashMap<String, LyricPayload>> {
+    PAYLOAD_MEM.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 完整管线：内存 payload 缓存 →（闸门）→ 内存映射缓存 → 磁盘映射缓存 →
+/// InfLink ID 直取 / 搜索匹配 → 歌词 → 落盘。
 /// 错误带结构化前缀（net:/nomatch:/nolyric:），前端按前缀决定是否重试。
 pub async fn fetch_lyrics_full(
     client: &NeteaseClient,
@@ -398,31 +460,47 @@ pub async fn fetch_lyrics_full(
     title: &str,
     artist: &str,
     duration_ms: Option<u64>,
+    song_id_hint: Option<u64>,
     key: &Mutex<HashMap<String, TrackKey>>,
 ) -> Result<LyricPayload, String> {
     let nk = format!("{}|{}", norm(title), norm(artist));
-
-    // 1. id 映射缓存（内存优先，磁盘兜底；旧缓存条目低于置信门槛时重新解析）
-    let mut map = key.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if map.is_empty() {
-        map = load_trackmap(dir);
+    if let Some(p) = payload_mem().lock().unwrap_or_else(|e| e.into_inner()).get(&nk) {
+        return Ok(p.clone());
     }
-    let (song_id, dur_cached, pic_url) = match map.get(&nk) {
-        Some(k) if k.pic_url.is_some() && k.score >= MIN_MATCH_SCORE => {
-            (k.song_id, k.duration_ms, k.pic_url.clone())
+    let _gate = FETCH_GATE.lock().await;
+    // 双重检查：排队期间同请求可能已被先到者完成
+    if let Some(p) = payload_mem().lock().unwrap_or_else(|e| e.into_inner()).get(&nk) {
+        return Ok(p.clone());
+    }
+
+    // 1. 定位歌曲 ID：InfLink 精确 ID 优先（零误配），
+    //    否则走 id 映射缓存（内存优先，磁盘兜底；低置信条目重新解析）
+    let (song_id, dur_cached, pic_url) = if let Some(sid) = song_id_hint {
+        (sid, duration_ms, None)
+    } else {
+        let mut map = key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if map.is_empty() {
+            map = load_trackmap(dir);
         }
-        _ => {
-            let (sid, dur, pic, score) = client
-                .resolve(title, artist, duration_ms)
-                .await
-                .map_err(|e| e.to_reason())?;
-            map.insert(
-                nk.clone(),
-                TrackKey { song_id: sid, duration_ms: dur, pic_url: pic.clone(), score },
-            );
-            save_trackmap(dir, &map);
-            *key.lock().unwrap_or_else(|e| e.into_inner()) = map.clone();
-            (sid, dur, pic)
+        match map.get(&nk) {
+            Some(k) if k.pic_url.is_some() && k.score >= MIN_MATCH_SCORE => {
+                (k.song_id, k.duration_ms, k.pic_url.clone())
+            }
+            _ => {
+                let (sid, dur, pic, score) = client
+                    .resolve(title, artist, duration_ms)
+                    .await
+                    .map_err(|e| e.to_reason())?;
+                map.insert(
+                    nk.clone(),
+                    TrackKey { song_id: sid, duration_ms: dur, pic_url: pic.clone(), score },
+                );
+                if let Ok(s) = serde_json::to_string(&map) {
+                    atomic_write(&trackmap_path(dir), &s);
+                }
+                *key.lock().unwrap_or_else(|e| e.into_inner()) = map.clone();
+                (sid, dur, pic)
+            }
         }
     };
 
@@ -430,6 +508,10 @@ pub async fn fetch_lyrics_full(
     let cache = lyric_cache_path(dir, song_id);
     if let Ok(s) = fs::read_to_string(&cache) {
         if let Ok(p) = serde_json::from_str::<LyricPayload>(&s) {
+            payload_mem()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(nk, p.clone());
             return Ok(p);
         }
     }
@@ -456,7 +538,80 @@ pub async fn fetch_lyrics_full(
     };
     let _ = fs::create_dir_all(cache.parent().unwrap());
     if let Ok(s) = serde_json::to_string(&payload) {
-        let _ = fs::write(&cache, s);
+        atomic_write(&cache, &s);
     }
+    payload_mem()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(nk, payload.clone());
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artists(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn exact_title_and_artist_scores_high() {
+        let sc = score_candidate(
+            "晴天", &artists(&["周杰伦"]), 269000, "晴天", &["周杰伦".into()], Some(269000),
+        );
+        // 歌名 100 + 歌手 30+15 + 时长 120 = 265
+        assert_eq!(sc, 265);
+    }
+
+    #[test]
+    fn artist_mismatch_is_penalized_below_threshold() {
+        // 同名不同人：歌名 100 - 歌手不匹配 50 = 50 < 60 门槛 → 拒选
+        let sc = score_candidate(
+            "晴天", &artists(&["某人Cover"]), 269000, "晴天", &["周杰伦".into()], None,
+        );
+        assert!(sc < MIN_MATCH_SCORE);
+    }
+
+    #[test]
+    fn duration_mismatch_penalized() {
+        // 歌名歌手都对但时长差 30s：100+45-80 = 65，仍然过线但明显降分
+        let sc = score_candidate(
+            "晴天", &artists(&["周杰伦"]), 239000, "晴天", &["周杰伦".into()], Some(269000),
+        );
+        assert_eq!(sc, 65);
+    }
+
+    #[test]
+    fn live_version_penalized() {
+        let base = score_candidate(
+            "晴天", &artists(&["周杰伦"]), 0, "晴天", &["周杰伦".into()], None,
+        );
+        let live = score_candidate(
+            "晴天 (Live)", &artists(&["周杰伦"]), 0, "晴天", &["周杰伦".into()], None,
+        );
+        // Live 版歌名带后缀：歌名匹配等级从精确(100)降为包含(40)，再加
+        // 版本词惩罚(-60)，总分必须显著低于原版
+        assert!(live <= base - 60, "live={} base={}", live, base);
+        assert!(live < MIN_MATCH_SCORE + 45, "live={} 应接近被拒选", live);
+    }
+
+    #[test]
+    fn query_with_marker_not_penalized() {
+        // 用户明确搜 Live 版：候选 Live 不惩罚
+        let sc = score_candidate(
+            "晴天 (Live)", &artists(&["周杰伦"]), 0, "晴天 Live", &["周杰伦".into()], None,
+        );
+        assert!(sc >= MIN_MATCH_SCORE);
+    }
+
+    #[test]
+    fn multi_artist_partial_match() {
+        // 合唱曲：查询两个歌手只中一个 → 30 分，无全中奖励
+        let sc = score_candidate(
+            "曲", &artists(&["甲", "乙"]), 0, "曲", &["甲".into(), "丙".into()], None,
+        );
+        // 歌名 100 + 歌手 30 - 全中未达成 = 130
+        assert_eq!(sc, 130);
+    }
 }

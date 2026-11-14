@@ -49,7 +49,8 @@ function parseLrc(lrc: string): LyricLine[] {
 export async function loadLyrics(
   title: string,
   artist: string,
-  durationMs: number | null
+  durationMs: number | null,
+  songId: number | null
 ): Promise<(LyricPayload & { lines: LyricLine[]; kar: KaraokeLine[] }) | null> {
   const key = `${title}|${artist}`;
   if (key === lastRequest && memCache.size > 0) {
@@ -64,6 +65,7 @@ export async function loadLyrics(
       title,
       artist,
       durationMs,
+      songId,
     });
     let lines = parseLrc(payload.lrc);
     const kar = payload.timed ? parseYrc(payload.timed) : [];

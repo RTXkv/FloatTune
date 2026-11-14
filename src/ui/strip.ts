@@ -227,10 +227,10 @@ export function mountStrip() {
     idleMark = KAOMOJI[Math.floor(Math.random() * KAOMOJI.length)];
     setLyricText(idleMark);
     if (s.lyric_style !== "off" && t.title) {
-      // 时长特征供匹配打分：InfLink 在位时是真实时长
+      // InfLink 精确 ID 优先（零误配）；时长特征供搜索匹配打分
       const durHint =
         t.timeline_valid && t.duration_ms > 0 ? t.duration_ms : null;
-      loadLyrics(t.title, t.artist, durHint).then((p) => {
+      loadLyrics(t.title, t.artist, durHint, t.song_id ?? null).then((p) => {
         // 网络抖动 3 秒后自动重试；nomatch/nolyric 是结论性失败，重试只会
         // 打死搜索接口——留颜文字降级
         if (!p && lastFailKind === "net") {
@@ -240,6 +240,17 @@ export function mountStrip() {
               ensureLyrics();
             }
           }, 3000);
+          return;
+        }
+        // 搜索低置信但 InfLink 可能有精确 ID（封面任务 ~1.2s 后提取到位）：
+        // 2.5s 后检查，拿到 ID 则按 ID 直取重试一次
+        if (!p && lastFailKind === "nomatch") {
+          window.setTimeout(() => {
+            if (lyricReqKey === key && (store.track?.song_id ?? null)) {
+              lyricReqKey = "";
+              ensureLyrics();
+            }
+          }, 2500);
           return;
         }
         if (key !== lyricReqKey || !p) return;

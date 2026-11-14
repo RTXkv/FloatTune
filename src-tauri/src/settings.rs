@@ -152,3 +152,35 @@ fn sanitize(s: &mut Settings) {
     }
     s.config_version = CONFIG_VERSION;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_clamps_garbage_values() {
+        let mut s = Settings::default();
+        s.active_opacity = 5.0;
+        s.idle_opacity = -1.0;
+        s.ui_scale = 9.9;
+        s.lyric_font_size = 500.0;
+        s.hide_delay_secs = 9999;
+        s.lyric_style = "hacker".into();
+        sanitize(&mut s);
+        assert_eq!(s.active_opacity, 1.0);
+        assert_eq!(s.idle_opacity, 0.0);
+        assert_eq!(s.ui_scale, 2.0);
+        assert_eq!(s.lyric_font_size, 60.0);
+        assert_eq!(s.hide_delay_secs, 120);
+        assert_eq!(s.lyric_style, "single");
+        assert_eq!(s.config_version, CONFIG_VERSION);
+    }
+
+    #[test]
+    fn old_style_value_survives() {
+        let mut s = Settings::default();
+        s.lyric_style = "scroll".into();
+        sanitize(&mut s);
+        assert_eq!(s.lyric_style, "scroll");
+    }
+}

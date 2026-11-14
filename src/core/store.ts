@@ -12,6 +12,9 @@ export interface TrackSnapshot {
   position_ms: number;
   duration_ms: number;
   source: string;
+  /** InfLink 提供的网易云歌曲精确 ID（null = 不可用） */
+  song_id: number | null;
+  track_generation: number;
 }
 
 export interface Settings {
