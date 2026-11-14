@@ -2,7 +2,7 @@
 import "../styles/strip.css";
 import { store } from "../core/store";
 import { PositionClock, fmtTime } from "../core/clock";
-import { loadLyrics, currentLineIndex, LyricLine } from "../core/lyrics";
+import { loadLyrics, currentLineIndex, LyricLine, lastFailKind } from "../core/lyrics";
 import { renderKaraoke, currentKaraokeIndex, KaraokeLine } from "../core/karaoke";
 import { marquee, restartLyricScroll, marqueeSetPlaying } from "./marquee";
 import { invoke } from "@tauri-apps/api/core";
@@ -227,9 +227,13 @@ export function mountStrip() {
     idleMark = KAOMOJI[Math.floor(Math.random() * KAOMOJI.length)];
     setLyricText(idleMark);
     if (s.lyric_style !== "off" && t.title) {
-      loadLyrics(t.title, t.artist).then((p) => {
-        // 加载失败（网络抖动等）3 秒后自动重试，避免整首歌卡在占位符
-        if (!p) {
+      // 时长特征供匹配打分：InfLink 在位时是真实时长
+      const durHint =
+        t.timeline_valid && t.duration_ms > 0 ? t.duration_ms : null;
+      loadLyrics(t.title, t.artist, durHint).then((p) => {
+        // 网络抖动 3 秒后自动重试；nomatch/nolyric 是结论性失败，重试只会
+        // 打死搜索接口——留颜文字降级
+        if (!p && lastFailKind === "net") {
           window.setTimeout(() => {
             if (lyricReqKey === key) {
               lyricReqKey = "";
@@ -260,6 +264,7 @@ export function mountStrip() {
       line.classList.remove("swap");
       void line.offsetWidth;
       line.classList.add("swap");
+      line.textContent = text; // 此前丢失的关键赋值：纯音乐切歌后行内容永远停在上一首
     }
     restartLyricScroll(line, durMs);
   }
@@ -309,15 +314,17 @@ export function mountStrip() {
       lastMk = mk;
       restartLyricScroll(strip, (cur.end - cur.start) * 0.65);
     }
-    // 逐字进度点亮
+    // 逐字进度点亮（值不变不写，减少高频样式重算）
     if (cur.karLine) {
       const spans = strip.querySelectorAll<HTMLElement>(".kw");
       const t = Math.max(cur.start, Math.min(pos, cur.end));
       cur.karLine.words.forEach((wd, i) => {
         const sp = spans[i];
         if (!sp) return;
-        const pr = Math.max(0, Math.min(1, (t - wd.start) / wd.dur));
-        sp.style.setProperty("--p", pr.toFixed(3));
+        const pr = Math.max(0, Math.min(1, (t - wd.start) / wd.dur)).toFixed(3);
+        if (sp.style.getPropertyValue("--p") !== pr) {
+          sp.style.setProperty("--p", pr);
+        }
       });
     }
   }
@@ -363,7 +370,21 @@ export function mountStrip() {
       }
       return;
     }
-    if (lyricLines.length === 0) return;
+    if (lyricLines.length === 0) {
+      // 纯音乐：multi 行由本分支维护（setLyricText 对 multi 提前返回），
+      // 必须在这里清成颜文字，否则 l-cur 永远停在上一首的歌词
+      if (lyricBox.classList.contains("multi")) {
+        const prev = lyricBox.querySelector(".l-prev") as HTMLDivElement | null;
+        const cur = lyricBox.querySelector(".l-cur") as HTMLDivElement | null;
+        const next = lyricBox.querySelector(".l-next") as HTMLDivElement | null;
+        if (cur && cur.textContent !== idleMark) {
+          cur.textContent = idleMark;
+          if (prev) prev.textContent = "";
+          if (next) next.textContent = "";
+        }
+      }
+      return;
+    }
     const idx = currentLineIndex(lyricLines, pos);
     if (idx === lastLyricIdx) return;
     lastLyricIdx = idx;

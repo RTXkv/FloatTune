@@ -8,7 +8,6 @@ mod visibility;
 mod volume;
 mod win32;
 
-use netease::NeteaseClient;
 use settings::Settings;
 use smtc::{MediaCommand, TrackSnapshot};
 use std::collections::HashMap;
@@ -208,11 +207,14 @@ async fn fetch_lyrics(
     app: tauri::AppHandle,
     title: String,
     artist: String,
+    duration_ms: Option<u64>,
 ) -> Result<netease::LyricPayload, String> {
     let state = app.state::<AppState>();
     let dir = state.data_dir.clone();
-    let client = NeteaseClient::new();
-    netease::fetch_lyrics_full(&client, &dir, &title, &artist, &state.lyric_key_cache).await
+    // 共享客户端：连接池跨请求复用
+    let client = netease::shared_client();
+    netease::fetch_lyrics_full(client, &dir, &title, &artist, duration_ms, &state.lyric_key_cache)
+        .await
 }
 
 #[tauri::command]

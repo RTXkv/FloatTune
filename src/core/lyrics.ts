@@ -23,6 +23,9 @@ export interface LyricLine {
 const memCache = new Map<number, LyricPayload & { lines: LyricLine[]; kar: KaraokeLine[] }>();
 let lastRequest = "";
 
+/** 最近一次加载失败的原因分类：net（可重试）/ nomatch / nolyric（不可重试） */
+export let lastFailKind: "" | "net" | "nomatch" | "nolyric" = "";
+
 function parseLrc(lrc: string): LyricLine[] {
   const lines: LyricLine[] = [];
   for (const raw of lrc.split(/\r?\n/)) {
@@ -45,7 +48,8 @@ function parseLrc(lrc: string): LyricLine[] {
 
 export async function loadLyrics(
   title: string,
-  artist: string
+  artist: string,
+  durationMs: number | null
 ): Promise<(LyricPayload & { lines: LyricLine[]; kar: KaraokeLine[] }) | null> {
   const key = `${title}|${artist}`;
   if (key === lastRequest && memCache.size > 0) {
@@ -54,8 +58,13 @@ export async function loadLyrics(
     if (first && first.title === title && first.artist === artist) return first;
   }
   lastRequest = key;
+  lastFailKind = "";
   try {
-    const payload = await invoke<LyricPayload>("fetch_lyrics", { title, artist });
+    const payload = await invoke<LyricPayload>("fetch_lyrics", {
+      title,
+      artist,
+      durationMs,
+    });
     let lines = parseLrc(payload.lrc);
     const kar = payload.timed ? parseYrc(payload.timed) : [];
     // 纯音乐/无歌词检测：网易会给纯音乐标注“纯音乐，请欣赏”类歌词；
@@ -73,8 +82,18 @@ export async function loadLyrics(
     }).catch(() => {});
     return full;
   } catch (e) {
+    const msg = String(e);
+    // 错误分类：net: 网络问题（可重试）；nomatch:/nolyric: 结论性问题（重试无意义，
+    // 避免每 3s 打一次搜索接口）
+    lastFailKind = msg.startsWith("net:")
+      ? "net"
+      : msg.startsWith("nomatch:")
+        ? "nomatch"
+        : msg.startsWith("nolyric:")
+          ? "nolyric"
+          : "net";
     void invoke("debug_log", {
-      msg: `lyrfail "${title}": ${String(e).slice(0, 140)}`,
+      msg: `lyrfail(${lastFailKind}) "${title}": ${msg.slice(0, 140)}`,
     }).catch(() => {});
     return null;
   }

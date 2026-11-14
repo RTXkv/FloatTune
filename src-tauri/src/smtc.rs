@@ -355,7 +355,14 @@ fn watch(app: tauri::AppHandle, rx: Receiver<MediaCommand>, snapshot: Arc<Mutex<
                         snap.title = title;
                         snap.artist = artist;
                         snap.album.clear();
+                        // 旧歌封面立即清除（SMTC 封面流更新慢半拍，不清会残留旧封面；
+                        // 纯音乐时前端没有 API 封面兜底，必须靠这里清干净）
+                        snap.cover_b64 = None;
                         snap.source = "cloudmusic".into();
+                        // timeline 还是上一首的残留值：立即失效，等新歌的第一次推送
+                        // 再置有效（防止歌词匹配用旧歌时长打分误伤）
+                        snap.timeline_valid = false;
+                        snap.duration_ms = 0;
                     }
                     let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let _ = app.emit("smtc:track", &snap);
@@ -431,6 +438,15 @@ fn parse_window_title(raw: &str) -> Option<(String, String)> {
     }
 }
 
+/// 宽松归一（封面标题比对用）：去空白 + 小写；SMTC 元数据与窗口标题的
+/// 细微差异（全半角空格等）不应导致封面被误判为旧歌
+fn norm_loose(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 /// 后台单飞取封面：SMTC 元数据请求可能卡数秒，完全隔离在独立线程
 fn kick_cover(
     app: &tauri::AppHandle,
@@ -454,26 +470,33 @@ fn kick_cover(
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
-            // 最多 5 次（网易云封面流慢半拍；单次请求可能挂起数秒）
-            for attempt in 0..5u32 {
+            // 最多 6 次 × 1.2s（网易云封面流慢半拍；单次请求可能挂起数秒）。
+            // 每次先校验 SMTC 元数据标题已跟上当前歌——元数据还是上一首时
+            // 取到的封面必然也是旧的，"成功即停"会让旧封面永久停留
+            for attempt in 0..6u32 {
                 let props = find_session_props(&manager);
                 if let Some(props) = props {
-                    if let Ok(cov) = fetch_cover(&props) {
-                        {
-                            let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
-                            s.cover_b64 = Some(cov);
+                    let ptitle = props.Title().map(|x| x.to_string()).unwrap_or_default();
+                    let cur_title = snapshot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .title
+                        .clone();
+                    let stale = norm_loose(&ptitle) != norm_loose(&cur_title);
+                    if !stale {
+                        if let Ok(cov) = fetch_cover(&props) {
+                            {
+                                let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                                s.cover_b64 = Some(cov);
+                            }
+                            let s = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            let _ = app.emit("smtc:track", &s);
+                            break;
                         }
-                        let s = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        let _ = app.emit("smtc:track", &s);
-                        break;
                     }
                 }
-                if attempt == 4 {
-                    // 放弃：置 None 让前端走 API 封面兜底
-                    let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
-                    if s.cover_b64.is_none() {
-                        s.cover_b64 = None;
-                    }
+                if attempt == 5 {
+                    // 放弃：cover_b64 保持 None（切歌时已清），前端走 API 封面兜底
                     let s = snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let _ = app.emit("smtc:track", &s);
                 }

@@ -2,7 +2,7 @@
 import "../styles/card.css";
 import { store } from "../core/store";
 import { PositionClock, fmtTime } from "../core/clock";
-import { loadLyrics, currentLineIndex, LyricLine } from "../core/lyrics";
+import { loadLyrics, currentLineIndex, LyricLine, lastFailKind } from "../core/lyrics";
 import { renderKaraoke, currentKaraokeIndex, KaraokeLine } from "../core/karaoke";
 import { restartLyricScroll, stopLyricScroll } from "./marquee";
 import { marqueeSetPlaying } from "./marquee";
@@ -287,9 +287,13 @@ export function mountCard() {
     lineCur.textContent = idleMark;
     lineNxt.textContent = "";
     if (s.lyric_style !== "off" && t.title) {
-      loadLyrics(t.title, t.artist).then((p) => {
-        // 加载失败（网络抖动等）3 秒后自动重试，避免整首歌卡在占位符
-        if (!p) {
+      // 时长特征供匹配打分：InfLink 在位时是真实时长
+      const durHint =
+        t.timeline_valid && t.duration_ms > 0 ? t.duration_ms : null;
+      loadLyrics(t.title, t.artist, durHint).then((p) => {
+        // 网络抖动 3 秒后自动重试；nomatch/nolyric 是结论性失败，重试只会
+        // 打死搜索接口——留颜文字降级
+        if (!p && lastFailKind === "net") {
           window.setTimeout(() => {
             if (lyricReqKey === key) {
               lyricReqKey = "";
@@ -438,15 +442,17 @@ export function mountCard() {
       lastMk = mk;
       restartLyricScroll(strip, cur.end - cur.start);
     }
-    // 逐字进度点亮
+    // 逐字进度点亮（值不变不写，减少高频样式重算）
     if (cur.karLine) {
       const spans = strip.querySelectorAll<HTMLElement>(".kw");
       const t = Math.max(cur.start, Math.min(pos, cur.end));
       cur.karLine.words.forEach((wd, i) => {
         const sp = spans[i];
         if (!sp) return;
-        const pr = Math.max(0, Math.min(1, (t - wd.start) / wd.dur));
-        sp.style.setProperty("--p", pr.toFixed(3));
+        const pr = Math.max(0, Math.min(1, (t - wd.start) / wd.dur)).toFixed(3);
+        if (sp.style.getPropertyValue("--p") !== pr) {
+          sp.style.setProperty("--p", pr);
+        }
       });
     }
   }

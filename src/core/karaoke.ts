@@ -75,8 +75,11 @@ export function renderKaraoke(
   line.words.forEach((wd, i) => {
     const span = spans[i];
     if (!span) return;
-    const p = Math.max(0, Math.min(1, (pos - wd.start) / wd.dur));
-    span.style.setProperty("--p", p.toFixed(3));
+    const p = Math.max(0, Math.min(1, (pos - wd.start) / wd.dur)).toFixed(3);
+    // 值没变不写样式（心跳 100ms × 每字一次的无效写会强制样式重算）
+    if (span.style.getPropertyValue("--p") !== p) {
+      span.style.setProperty("--p", p);
+    }
   });
 }
 
