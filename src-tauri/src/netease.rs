@@ -438,8 +438,31 @@ static FETCH_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static PAYLOAD_MEM: std::sync::OnceLock<Mutex<HashMap<String, LyricPayload>>> =
     std::sync::OnceLock::new();
 
+/// 内存缓存上限：超过整体清空（重建成本低，不做 LRU 换简单性）
+const PAYLOAD_MEM_MAX: usize = 32;
+
 fn payload_mem() -> &'static Mutex<HashMap<String, LyricPayload>> {
     PAYLOAD_MEM.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// payload 缓存身份（纯函数可测试）：
+/// - 精确 song_id → "id:{id}"：同名同歌手的不同歌曲（不同 ID）天然隔离，
+///   精确 ID 请求绝不命中搜索路径的缓存
+/// - 无 ID → "t:{title}|{artist}"：搜索路径自己的命名空间
+fn payload_key(song_id: Option<u64>, title: &str, artist: &str) -> String {
+    match song_id {
+        Some(id) => format!("id:{}", id),
+        None => format!("t:{}|{}", norm(title), norm(artist)),
+    }
+}
+
+/// 写入内存 payload 缓存（带容量上限；超限整体清空，重建成本低）
+fn payload_mem_put(key: String, p: LyricPayload) {
+    let mut m = payload_mem().lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() >= PAYLOAD_MEM_MAX {
+        m.clear();
+    }
+    m.insert(key, p);
 }
 
 /// 完整管线：内存 payload 缓存 →（闸门）→ 内存映射缓存 → 磁盘映射缓存 →
@@ -454,7 +477,7 @@ pub async fn fetch_lyrics_full(
     song_id_hint: Option<u64>,
     key: &Mutex<HashMap<String, TrackKey>>,
 ) -> Result<LyricPayload, String> {
-    let nk = format!("{}|{}", norm(title), norm(artist));
+    let nk = payload_key(song_id_hint, title, artist);
     if let Some(p) = payload_mem().lock().unwrap_or_else(|e| e.into_inner()).get(&nk) {
         return Ok(p.clone());
     }
@@ -499,10 +522,7 @@ pub async fn fetch_lyrics_full(
     let cache = lyric_cache_path(dir, song_id);
     if let Ok(s) = fs::read_to_string(&cache) {
         if let Ok(p) = serde_json::from_str::<LyricPayload>(&s) {
-            payload_mem()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(nk, p.clone());
+            payload_mem_put(nk, p.clone());
             return Ok(p);
         }
     }
@@ -531,10 +551,7 @@ pub async fn fetch_lyrics_full(
     if let Ok(s) = serde_json::to_string(&payload) {
         atomic_write(&cache, &s);
     }
-    payload_mem()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(nk, payload.clone());
+    payload_mem_put(nk, payload.clone());
     Ok(payload)
 }
 
@@ -604,5 +621,69 @@ mod tests {
         );
         // 歌名 100 + 歌手 30 - 全中未达成 = 130
         assert_eq!(sc, 130);
+    }
+}
+
+#[cfg(test)]
+mod payload_key_tests {
+    use super::*;
+
+    /// 任务书场景 1：同名同歌手不同 song_id → 必须是不同的缓存身份
+    #[test]
+    fn same_title_artist_different_ids_are_distinct() {
+        let a = payload_key(Some(100), "晴天", "周杰伦");
+        let b = payload_key(Some(200), "晴天", "周杰伦");
+        assert_ne!(a, b);
+        assert_eq!(a, "id:100");
+        assert_eq!(b, "id:200");
+    }
+
+    /// 场景 2：先请求 ID A 再请求 ID B（顺序无关的身份）
+    #[test]
+    fn request_order_a_then_b() {
+        let ka = payload_key(Some(100), "晴天", "周杰伦");
+        let kb = payload_key(Some(200), "晴天", "周杰伦");
+        // A 的缓存绝不会被 B 命中，反之亦然
+        assert_ne!(ka, kb);
+        // 再请求一次 A（重复播放同一首）
+        assert_eq!(payload_key(Some(100), "晴天", "周杰伦"), ka);
+    }
+
+    /// 场景 3：反序（先 B 后 A）身份同样稳定
+    #[test]
+    fn request_order_b_then_a() {
+        let kb = payload_key(Some(200), "晴天", "周杰伦");
+        let ka = payload_key(Some(100), "晴天", "周杰伦");
+        assert_ne!(kb, ka);
+        assert_eq!(payload_key(Some(200), "晴天", "周杰伦"), kb);
+    }
+
+    /// 场景 4：搜索请求与精确 ID 请求交替 → 不同命名空间互相隔离
+    #[test]
+    fn search_and_id_namespaces_isolated() {
+        let search = payload_key(None, "晴天", "周杰伦");
+        let by_id = payload_key(Some(100), "晴天", "周杰伦");
+        // ID 请求绝不命中搜索路径的缓存（前缀隔离）
+        assert_ne!(search, by_id);
+        assert!(search.starts_with("t:"));
+        assert!(by_id.starts_with("id:"));
+    }
+
+    /// 补充：无 ID 路径的归一身份（空白/大小写差异同身份）
+    #[test]
+    fn search_key_normalized() {
+        assert_eq!(
+            payload_key(None, "晴天", "周杰伦"),
+            payload_key(None, "晴天 ", "周 杰 伦")
+        );
+    }
+
+    /// 补充：ID 身份与标题无关（标题字符串变化不影响 id: 键）
+    #[test]
+    fn id_key_ignores_title_drift() {
+        assert_eq!(
+            payload_key(Some(100), "晴天", "周杰伦"),
+            payload_key(Some(100), "晴 天（Live）", "周杰伦")
+        );
     }
 }
