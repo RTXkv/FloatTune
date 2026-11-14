@@ -449,8 +449,14 @@ fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
                 }
             } else if moved {
                 stale_ticks = 0;
-            } else if inactive == Some(false) {
-                // 真的在出声但 timeline 不动：推送端挂起
+            } else if inactive == Some(false)
+                && smtc_raw.as_deref() == Some("playing")
+                && title_changed_at.elapsed().as_millis() as u64 >= TRACK_GAP_SUPPRESS_MS
+            {
+                // 真的在出声（音频会话 Active + raw 报 playing）但 timeline 不动：
+                // 推送端挂起。三个条件缺一不可——暂停后音频会话有 10-20s OS 迟滞
+                // 仍报 Active，若只看会话状态，暂停会被误判死并回退到迟滞路径，
+                // 造成"暂停后卡片重现几秒再消失"的振荡；切歌间隙同样需要宽限。
                 stale_ticks += 1;
                 if stale_ticks >= INFLINK_STALE_TICKS {
                     inflink = false;
