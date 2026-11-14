@@ -53,7 +53,7 @@ pub fn log_write(msg: &str) {
     let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
     // 写入期轮转检查（每 200 条一次）：长期运行不再受"只在启动时检查"
     // 的限制；替换失败（文件被外部占用）则丢弃后续写入，不影响主程序
-    if n % LOG_CHECK_EVERY == 0 {
+    if n.is_multiple_of(LOG_CHECK_EVERY) {
         if let Some(f) = guard.as_mut() {
             if let Ok(meta) = f.metadata() {
                 if meta.len() > LOG_MAX_BYTES {
