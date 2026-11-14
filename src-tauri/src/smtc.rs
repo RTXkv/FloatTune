@@ -304,7 +304,7 @@ fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
 
         // 4. 状态差分 → 事件 + 可见性
         if effective != last_status {
-            eprintln!(
+            crate::flog!(
                 "[smtc] status -> {} (t+{}ms)",
                 effective,
                 start.elapsed().as_millis()
@@ -332,7 +332,7 @@ fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
                 if moved {
                     inflink = true;
                     stale_ticks = 0;
-                    eprintln!("[smtc] InfLink detected (timeline advancing)");
+                    crate::flog!("[smtc] InfLink detected (timeline advancing)");
                 }
             } else if moved {
                 stale_ticks = 0;
@@ -342,7 +342,7 @@ fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
                 if stale_ticks >= INFLINK_STALE_TICKS {
                     inflink = false;
                     stale_ticks = 0;
-                    eprintln!(
+                    crate::flog!(
                         "[smtc] InfLink push stalled (timeline frozen ~{}s while playing), falling back",
                         (INFLINK_STALE_TICKS * TICK_MS as u32) / 1000
                     );
@@ -371,7 +371,7 @@ fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
             // timeline 消失（会话关闭/SMTC 端清空）
             inflink = false;
             stale_ticks = 0;
-            eprintln!("[smtc] InfLink lost (timeline gone)");
+            crate::flog!("[smtc] InfLink lost (timeline gone)");
             {
                 let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
                 snap.timeline_valid = false;
@@ -382,11 +382,11 @@ fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
 
         // 5. 曲目差分（窗口标题 "歌名 - 歌手"）
         if let Some(raw) = &raw_title {
-            if let Some((title, artist)) = parse_window_title(&raw) {
+            if let Some((title, artist)) = parse_window_title(raw) {
                 let key = (title.clone(), artist.clone());
                 if last_title_key.as_ref() != Some(&key) {
                     title_changed_at = Instant::now();
-                    eprintln!(
+                    crate::flog!(
                         "[smtc] track -> {} / {} (t+{}ms)",
                         title,
                         artist,
@@ -421,8 +421,8 @@ fn watch(app: tauri::AppHandle, snapshot: Arc<Mutex<TrackSnapshot>>) {
 
         // 6. 静默诊断（每 ~12s 一条，观测快路径健康度）
         tick += 1;
-        if tick % 100 == 0 {
-            eprintln!(
+        if tick.is_multiple_of(100) {
+            crate::flog!(
                 "[smtc] tick={} title={:?} inactive={:?} t+{}ms",
                 tick,
                 raw_title.as_deref().unwrap_or(""),
@@ -560,7 +560,7 @@ fn kick_cover(
                         // 元数据已跟上当前歌：提取 InfLink 歌曲精确 ID（genre 字段
                         // NCM-{ID}），供歌词管线跳过搜索匹配
                         if let Some(sid) = extract_ncm_id(&props) {
-                            eprintln!("[smtc] InfLink song_id={} extracted", sid);
+                            crate::flog!("[smtc] InfLink song_id={} extracted", sid);
                             let mut s = snapshot.lock().unwrap_or_else(|e| e.into_inner());
                             if s.track_generation == gen {
                                 s.song_id = Some(sid);
@@ -670,7 +670,7 @@ fn handle_command(
         }
     }
     let Some(m) = manager else {
-        eprintln!("[{}] no smtc manager, media key only", id);
+        crate::flog!("[{}] no smtc manager, media key only", id);
         send_media_key(match cmd {
             MediaCommand::PlayPause => VK_MEDIA_PLAY_PAUSE,
             MediaCommand::Next => VK_MEDIA_NEXT_TRACK,
@@ -686,9 +686,9 @@ fn handle_command(
     };
 
     let smtc_ok = try_smtc_once(m, cmd);
-    eprintln!("[{}] {:?} smtc_ok={}", id, cmd, smtc_ok);
+    crate::flog!("[{}] {:?} smtc_ok={}", id, cmd, smtc_ok);
     if smtc_ok && verify_changed(m, &before, cmd, 2500) {
-        eprintln!("[{}] confirmed (smtc channel)", id);
+        crate::flog!("[{}] confirmed (smtc channel)", id);
         return;
     }
     match cmd {
@@ -696,22 +696,22 @@ fn handle_command(
             // 补发一次媒体键（独立通道，绕过 InfLink 转发）
             send_media_key(vk);
             if verify_changed(m, &before, cmd, 2500) {
-                eprintln!("[{}] confirmed (media key)", id);
+                crate::flog!("[{}] confirmed (media key)", id);
             } else {
                 // 不再第三次发送：可能已执行，状态延迟中
-                eprintln!("[{}] unconfirmed (may still be executing)", id);
+                crate::flog!("[{}] unconfirmed (may still be executing)", id);
             }
         }
         _ => {
             if smtc_ok {
                 // 发送通道已确认可达，验证失败按"可能已执行但状态滞后"处理，不补发
-                eprintln!("[{}] unconfirmed (likely executed, NOT resending non-idempotent)", id);
+                crate::flog!("[{}] unconfirmed (likely executed, NOT resending non-idempotent)", id);
             } else {
                 send_media_key(vk);
                 if verify_changed(m, &before, cmd, 2500) {
-                    eprintln!("[{}] confirmed (media key)", id);
+                    crate::flog!("[{}] confirmed (media key)", id);
                 } else {
-                    eprintln!("[{}] unconfirmed", id);
+                    crate::flog!("[{}] unconfirmed", id);
                 }
             }
         }
@@ -761,7 +761,7 @@ fn verify_changed(
 }
 
 thread_local! {
-    static TITLE_BEFORE: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    static TITLE_BEFORE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 #[cfg(test)]

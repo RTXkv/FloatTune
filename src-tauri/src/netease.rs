@@ -232,7 +232,7 @@ impl NeteaseClient {
         if songs.is_empty() {
             return Err(ResolveFail::NoResult);
         }
-        let nt = norm(title);
+        let _nt = norm(title);
         // 查询歌手按集合切分（、/,/／），用于候选歌手的精确匹配
         let artist_tokens: Vec<String> = artist
             .split(['/', '、', ',', '，', '＆', '&'])
@@ -254,7 +254,7 @@ impl NeteaseClient {
         let mut best = songs.clone();
         best.sort_by_key(|s| std::cmp::Reverse(score(s)));
         let best_score = score(&best[0]);
-        eprintln!(
+        crate::flog!(
             "[netease] resolve \"{}|{}\" dur={:?} -> id={} score={} (candidates={})",
             title,
             artist,
@@ -264,7 +264,7 @@ impl NeteaseClient {
             best.len()
         );
         if best_score < MIN_MATCH_SCORE {
-            eprintln!("[netease] match below threshold, refusing to guess");
+            crate::flog!("[netease] match below threshold, refusing to guess");
             return Err(ResolveFail::LowConfidence(best_score));
         }
         let hit = &best[0];
@@ -353,21 +353,15 @@ impl NeteaseClient {
 }
 
 /// 曲目 id 映射缓存（标题|歌手 → id），避免重复搜索
-fn trackmap_path(dir: &PathBuf) -> PathBuf {
+fn trackmap_path(dir: &std::path::Path) -> PathBuf {
     dir.join("trackmap.json")
 }
 
-fn load_trackmap(dir: &PathBuf) -> HashMap<String, TrackKey> {
+fn load_trackmap(dir: &std::path::Path) -> HashMap<String, TrackKey> {
     fs::read_to_string(trackmap_path(dir))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
-}
-
-fn save_trackmap(dir: &PathBuf, map: &HashMap<String, TrackKey>) {
-    if let Ok(s) = serde_json::to_string(map) {
-        let _ = fs::write(trackmap_path(dir), s);
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -394,13 +388,10 @@ async fn get_json_with_retry<T: serde::de::DeserializeOwned>(
             .header("Referer", "https://music.163.com")
             .send()
             .await;
-        match r {
-            Ok(resp) => {
-                if let Ok(v) = resp.json::<T>().await {
-                    return Some(v);
-                }
+        if let Ok(resp) = r {
+            if let Ok(v) = resp.json::<T>().await {
+                return Some(v);
             }
-            Err(_) => {}
         }
         if attempt == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -424,7 +415,7 @@ impl NeteaseClient {
 }
 
 /// 歌词缓存文件：appdata/lyrics/{id}.json
-fn lyric_cache_path(dir: &PathBuf, id: u64) -> PathBuf {
+fn lyric_cache_path(dir: &std::path::Path, id: u64) -> PathBuf {
     dir.join("lyrics").join(format!("{id}.json"))
 }
 
@@ -432,11 +423,11 @@ fn lyric_cache_path(dir: &PathBuf, id: u64) -> PathBuf {
 fn atomic_write(path: &std::path::Path, data: &str) {
     let tmp = path.with_extension("tmp");
     if let Err(e) = fs::write(&tmp, data) {
-        eprintln!("[netease] 缓存写入失败 {}: {}", path.display(), e);
+        crate::flog!("[netease] 缓存写入失败 {}: {}", path.display(), e);
         return;
     }
     if let Err(e) = fs::rename(&tmp, path) {
-        eprintln!("[netease] 缓存替换失败 {}: {}", path.display(), e);
+        crate::flog!("[netease] 缓存替换失败 {}: {}", path.display(), e);
         let _ = fs::remove_file(&tmp);
     }
 }
@@ -456,7 +447,7 @@ fn payload_mem() -> &'static Mutex<HashMap<String, LyricPayload>> {
 /// 错误带结构化前缀（net:/nomatch:/nolyric:），前端按前缀决定是否重试。
 pub async fn fetch_lyrics_full(
     client: &NeteaseClient,
-    dir: &PathBuf,
+    dir: &std::path::Path,
     title: &str,
     artist: &str,
     duration_ms: Option<u64>,

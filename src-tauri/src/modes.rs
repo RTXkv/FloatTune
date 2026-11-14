@@ -11,7 +11,7 @@ pub const MODES: [&str; 2] = ["strip", "card"];
 const STRIP_SIZE: (f64, f64) = (620.0, 56.0);
 const CARD_SIZE: (f64, f64) = (250.0, 232.0);
 
-fn get_window<'a>(app: &'a AppHandle, label: &str) -> Option<WebviewWindow> {
+fn get_window(app: &AppHandle, label: &str) -> Option<WebviewWindow> {
     app.get_webview_window(label)
 }
 
@@ -52,7 +52,7 @@ fn taskbar_height_phys(win: &WebviewWindow) -> f64 {
 
 /// 切换并定位窗口；同时应用点击穿透状态
 pub fn show_mode(app: &AppHandle, mode: &str, settings: &Settings) -> Result<(), String> {
-    eprintln!("[modes] show_mode {} begin tid={:?}", mode, std::thread::current().id());
+    crate::flog!("[modes] show_mode {} begin tid={:?}", mode, std::thread::current().id());
     for m in MODES {
         if m != mode {
             if let Some(w) = get_window(app, m) {
@@ -95,7 +95,7 @@ pub fn show_mode(app: &AppHandle, mode: &str, settings: &Settings) -> Result<(),
             // 默认高度 = 头部(封面+歌名) + 歌词区；垂直拖拽调整歌词区高度
             let dh = CARD_SIZE.1 * sc * u;
             let tb_h = taskbar_height_phys(&win);
-            let pos = remembered.unwrap_or_else(|| (mw - dw - 20.0 * sc, mh - tb_h - dh - 14.0 * sc, dw, dh));
+            let pos = remembered.unwrap_or((mw - dw - 20.0 * sc, mh - tb_h - dh - 14.0 * sc, dw, dh));
             let cw = if pos.2 > 0.0 { pos.2.clamp(250.0 * sc, 560.0 * sc) } else { dw };
             // 高度可自由调整（歌词区弹性伸缩）
             let ch = if pos.3 > 0.0 { pos.3.clamp(200.0 * sc, 700.0 * sc) } else { dh };
@@ -109,7 +109,7 @@ pub fn show_mode(app: &AppHandle, mode: &str, settings: &Settings) -> Result<(),
     let _ = win.set_position(PhysicalPosition::new(x, y));
     let _ = win.show();
     crate::visibility::mark_onscreen(mode);
-    eprintln!("[modes] show_mode {} end tid={:?}", mode, std::thread::current().id());
+    crate::flog!("[modes] show_mode {} end tid={:?}", mode, std::thread::current().id());
     let _ = win.set_ignore_cursor_events(settings.clickthrough_lock);
     // 同步分区穿透线程的缓存（mark_onscreen 后轮询恢复，需告知实际值）
     crate::passthrough_note(mode, settings.clickthrough_lock);

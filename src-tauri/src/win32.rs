@@ -44,7 +44,7 @@ pub fn taskbar_rect() -> Option<RECT> {
         GetWindowRect(hwnd, &mut rect).ok()?;
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
-        if w < 200 || h < 20 || h > 200 {
+        if w < 200 || !(20..=200).contains(&h) {
             return None;
         }
         Some(rect)
@@ -74,9 +74,18 @@ pub fn reassert_topmost(win: &tauri::WebviewWindow) {
     }
 }
 
+/// 本地时间戳（日志用）：HH:MM:SS.mmm。标准库无时区格式化，走 Win32 GetLocalTime
+pub fn local_time_str() -> String {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let st = unsafe { GetLocalTime() };
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+    )
+}
+
 /// 前台窗口是否为全屏应用（用于自动避让）
-pub fn foreground_fullscreen() -> bool {
-    unsafe {
+pub fn foreground_fullscreen() -> bool {    unsafe {
         let fg = GetForegroundWindow();
         if fg.0.is_null() || fg == GetDesktopWindow() {
             return false;
@@ -143,7 +152,6 @@ pub fn spawn_fullscreen_watcher(app: tauri::AppHandle) {
                     let playing = st.snapshot.lock().unwrap_or_else(|e| e.into_inner()).status == "playing";
                     let should_show =
                         (!s.show_only_playing || playing) && (!s.hide_fullscreen || !fs);
-                    drop(st);
                     if should_show {
                         if let Some(w) = app.get_webview_window(&s.mode) {
                             if w.is_visible().unwrap_or(false) {

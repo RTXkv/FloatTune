@@ -17,6 +17,47 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 
+// ---------- 日志：stderr + 文件持久化 ----------
+// 打包版直接启动时 stderr 无处可去，文件是唯一可回溯的诊断通道。
+// 超过 1MB 轮转为 floatune.log.1，最多保留一代。
+
+const LOG_MAX_BYTES: u64 = 1_000_000;
+static LOG_FILE: std::sync::OnceLock<Mutex<Option<fs::File>>> = std::sync::OnceLock::new();
+
+fn open_log_file(dir: &PathBuf) -> Option<fs::File> {
+    let _ = fs::create_dir_all(dir);
+    let path = dir.join("floatune.log");
+    // 轮转：超过上限时把旧文件改名让位（保留一代）
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() > LOG_MAX_BYTES {
+            let _ = fs::rename(&path, dir.join("floatune.log.1"));
+        }
+    }
+    fs::OpenOptions::new().create(true).append(true).open(&path).ok()
+}
+
+/// 写一条日志（时间戳 + 消息）到 stderr 与文件。所有文件操作不 panic：
+/// 日志路径出问题不能拖垮主程序
+pub fn log_write(msg: &str) {
+    let line = format!("[{}] {}\n", win32::local_time_str(), msg);
+    eprint!("{}", line);
+    let m = LOG_FILE.get_or_init(|| {
+        let dir = dirs_data_dir().unwrap_or_else(|| PathBuf::from("."));
+        Mutex::new(open_log_file(&dir))
+    });
+    let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = guard.as_mut() {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 带时间戳的日志宏（全 crate 通用）
+#[macro_export]
+macro_rules! flog {
+    ($($arg:tt)*) => { $crate::log_write(&format!($($arg)*)) };
+}
+
 /// 位置记忆落盘节流
 static LAST_POS_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -46,17 +87,21 @@ pub struct AppState {
 
 /// 浮窗点击穿透分区：前端上报 [x,y,w,h,kind]（物理像素，kind: 0=可交互 1=拖动区），
 /// 其余区域全部穿透。后台线程 30ms 轮询光标切换 ignore_cursor_events。
-static WINDOW_REGIONS: std::sync::OnceLock<Mutex<HashMap<String, Vec<(f64, f64, f64, f64, u8)>>>> =
+/// 分区矩形 [x, y, w, h, kind]
+type RegionRect = (f64, f64, f64, f64, u8);
+static WINDOW_REGIONS: std::sync::OnceLock<Mutex<HashMap<String, Vec<RegionRect>>>> =
     std::sync::OnceLock::new();
 
 /// 各窗口“实际已应用”的穿透状态缓存。轮询线程用它去重（避免每 30ms 重复调用
 /// set_ignore_cursor_events）；dissolve/restore 在轮询线程之外改动真实状态时，
 /// 必须经 passthrough_note 同步，否则缓存失步会导致恢复后整窗拦截点击，
 /// 直到光标进出一次功能区才自愈。
-static PASSTHROUGH_LAST: std::sync::OnceLock<Mutex<HashMap<String, bool>>> =
+/// 穿透状态缓存 label -> ignore
+type PassthroughMap = HashMap<String, bool>;
+static PASSTHROUGH_LAST: std::sync::OnceLock<Mutex<PassthroughMap>> =
     std::sync::OnceLock::new();
 
-fn passthrough_last() -> &'static Mutex<HashMap<String, bool>> {
+fn passthrough_last() -> &'static Mutex<PassthroughMap> {
     PASSTHROUGH_LAST.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -68,7 +113,7 @@ pub fn passthrough_note(label: &str, ignore: bool) {
         .insert(label.to_string(), ignore);
 }
 
-fn window_regions() -> &'static Mutex<HashMap<String, Vec<(f64, f64, f64, f64, u8)>>> {
+fn window_regions() -> &'static Mutex<HashMap<String, Vec<RegionRect>>> {
     WINDOW_REGIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -139,7 +184,7 @@ fn spawn_region_passthrough(app: tauri::AppHandle) {
 
 #[tauri::command]
 fn debug_log(msg: String) {
-    eprintln!("[fe] {}", msg);
+    crate::flog!("[fe] {}", msg);
 }
 
 /// 应用设置变更：持久化 → 窗口布局 → 托盘刷新 → 广播前端

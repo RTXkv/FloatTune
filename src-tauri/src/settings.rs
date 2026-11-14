@@ -81,7 +81,7 @@ impl Settings {
                 Ok(v) => v,
                 Err(e) => {
                     // 解析失败 = 配置损坏：保留原文件供人工恢复，回退默认值
-                    eprintln!("[settings] 配置解析失败（{}），回退默认值", e);
+                    crate::flog!("[settings] 配置解析失败（{}），回退默认值", e);
                     backup_corrupted(&path);
                     Settings::default()
                 }
@@ -102,24 +102,24 @@ impl Settings {
     /// （Windows 上 std::fs::rename 经 MoveFileEx(REPLACE_EXISTING) 可覆盖目标）
     pub fn save(&self, dir: &std::path::Path) {
         if let Err(e) = fs::create_dir_all(dir) {
-            eprintln!("[settings] 创建配置目录失败: {}", e);
+            crate::flog!("[settings] 创建配置目录失败: {}", e);
             return;
         }
         let json = match serde_json::to_string_pretty(self) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[settings] 配置序列化失败: {}", e);
+                crate::flog!("[settings] 配置序列化失败: {}", e);
                 return;
             }
         };
         let tmp = dir.join("settings.json.tmp");
         if let Err(e) = fs::write(&tmp, &json) {
-            eprintln!("[settings] 配置写入失败: {}", e);
+            crate::flog!("[settings] 配置写入失败: {}", e);
             return;
         }
         let path = dir.join("settings.json");
         if let Err(e) = fs::rename(&tmp, &path) {
-            eprintln!("[settings] 配置替换失败: {}（原配置保持不变）", e);
+            crate::flog!("[settings] 配置替换失败: {}（原配置保持不变）", e);
             let _ = fs::remove_file(&tmp);
         }
     }
@@ -130,8 +130,8 @@ impl Settings {
 fn backup_corrupted(path: &std::path::Path) {
     let bak = path.with_extension("bak");
     match fs::rename(path, &bak) {
-        Ok(_) => eprintln!("[settings] 原配置已保留为 {}", bak.display()),
-        Err(e) => eprintln!("[settings] 配置备份失败: {}", e),
+        Ok(_) => crate::flog!("[settings] 原配置已保留为 {}", bak.display()),
+        Err(e) => crate::flog!("[settings] 配置备份失败: {}", e),
     }
 }
 

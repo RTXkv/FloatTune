@@ -104,7 +104,7 @@ fn run_dissolve(w: &tauri::WebviewWindow, app: &AppHandle, expected: Option<u64>
     let Some(gen) = begin_dissolve(&label, expected) else {
         return;
     };
-    eprintln!(
+    crate::flog!(
         "[vis] dissolve {} (fade) tid={:?}",
         label,
         std::thread::current().id()
@@ -124,7 +124,7 @@ fn run_dissolve(w: &tauri::WebviewWindow, app: &AppHandle, expected: Option<u64>
         }
         if let Some(w2) = app2.get_webview_window(&label) {
             let _ = w2.hide();
-            eprintln!(
+            crate::flog!(
                 "[vis] dissolve done (faded+hidden) tid={:?}",
                 std::thread::current().id()
             );
@@ -154,7 +154,7 @@ pub fn update_visibility(app: &AppHandle) {
     if visible {
         if hidden {
             // 恢复：mark_onscreen 推进代数，使 dissolve 的 hide 定时器等旧任务失效
-            eprintln!("[vis] restore {} tid={:?}", s.mode, std::thread::current().id());
+            crate::flog!("[vis] restore {} tid={:?}", s.mode, std::thread::current().id());
             mark_onscreen(&s.mode);
             let gen = gen_of(&s.mode);
             let _ = w.show();
@@ -184,14 +184,14 @@ pub fn update_visibility(app: &AppHandle) {
                     let _ = w2.eval("document.getElementById('app').style.opacity='';");
                     let _ = app2.emit_to(&mode2, "vis", true);
                 }
-                eprintln!("[vis] restore done (nudge+fadein)");
+                crate::flog!("[vis] restore done (nudge+fadein)");
             });
         } else {
             // 已可见：无需视觉动作，但推进代数取消所有未决的隐藏任务
             bump_gen(&s.mode);
         }
     } else if !hidden {
-        eprintln!(
+        crate::flog!(
             "[vis] hide scheduled {} (delay={}s)",
             s.mode, s.hide_delay_secs
         );
@@ -211,7 +211,7 @@ pub fn update_visibility(app: &AppHandle) {
         };
         let wait_ms = (s.hide_delay_secs as u64 * 1000).saturating_sub(detected_lag_ms);
         let delay = std::time::Duration::from_millis(wait_ms);
-        eprintln!("[vis] hide delay={}ms", wait_ms);
+        crate::flog!("[vis] hide delay={}ms", wait_ms);
         std::thread::spawn(move || {
             // 等待锚定后的延迟；期间恢复播放/切换形态则整个取消
             std::thread::sleep(delay);
